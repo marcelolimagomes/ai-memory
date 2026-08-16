@@ -1057,6 +1057,10 @@ pub struct ExecutionEvidence {
     pub finalized_sessions: u64,
     /// Handoffs created by correlated sessions.
     pub handoffs_created: u64,
+    /// Correlated handoffs that have been accepted.
+    pub handoffs_accepted: u64,
+    /// Native sessions that consumed a correlated handoff.
+    pub handoff_accepting_session_ids: Vec<String>,
     /// Earliest receipt timestamp in Unix microseconds.
     pub first_seen_at: i64,
     /// Latest receipt timestamp in Unix microseconds.
@@ -1168,6 +1172,25 @@ impl ReaderPool {
                 [&execution_id],
                 |row| row.get::<_, u64>(0),
             )?;
+            let handoffs_accepted = conn.query_row(
+                "SELECT COUNT(DISTINCT h.id) FROM handoffs h JOIN ingest_keys i ON i.session_id = h.from_session_id \
+                 WHERE i.taskblu_execution_id = ?1 AND h.state = 'accepted'",
+                [&execution_id],
+                |row| row.get::<_, u64>(0),
+            )?;
+            let mut accepting_stmt = conn.prepare(
+                "SELECT DISTINCT h.accepted_by_session FROM handoffs h \
+                 JOIN ingest_keys i ON i.session_id = h.from_session_id \
+                 WHERE i.taskblu_execution_id = ?1 AND h.state = 'accepted' \
+                   AND h.accepted_by_session IS NOT NULL ORDER BY h.accepted_by_session",
+            )?;
+            let accepting_blobs = accepting_stmt
+                .query_map([&execution_id], |row| row.get::<_, Vec<u8>>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let handoff_accepting_session_ids = accepting_blobs
+                .iter()
+                .map(|bytes| SessionId::from_slice(bytes).map(|id| id.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
 
             Ok(Some(ExecutionEvidence {
                 taskblu_execution_id: execution_id,
@@ -1183,6 +1206,8 @@ impl ReaderPool {
                 replay_count,
                 finalized_sessions,
                 handoffs_created,
+                handoffs_accepted,
+                handoff_accepting_session_ids,
                 first_seen_at,
                 last_seen_at,
             }))

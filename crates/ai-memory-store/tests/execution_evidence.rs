@@ -1,7 +1,8 @@
 //! Contract tests for metadata-only execution receipts.
 
 use ai_memory_core::{
-    AgentKind, NewObservation, NewSession, ObservationKind, Sanitized, Sanitizer, SessionId,
+    AgentKind, HandoffAcceptance, NewHandoff, NewObservation, NewSession, ObservationKind,
+    OwnerFilter, Sanitized, Sanitizer, SessionId,
 };
 use ai_memory_store::{IngestCorrelation, IngestObservationOutcome, Store};
 use tempfile::TempDir;
@@ -91,6 +92,70 @@ async fn correlated_ingest_is_metadata_only_and_rejects_execution_drift() {
     let serialized = serde_json::to_string(&evidence).unwrap();
     assert!(!serialized.contains("PRIVATE_TITLE"));
     assert!(!serialized.contains("PRIVATE_BODY"));
+
+    let handoff = store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: workspace,
+            project_id: project,
+            from_session_id: Some(session),
+            from_agent: AgentKind::Hermes,
+            to_agent: Some(AgentKind::Codex),
+            cwd: None,
+            summary: "PRIVATE_HANDOFF".into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+    let receiver = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: receiver,
+            workspace_id: workspace,
+            project_id: project,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .writer
+            .accept_handoff(HandoffAcceptance {
+                handoff_id: handoff,
+                workspace_id: workspace,
+                project_id: project,
+                accepting_agent: AgentKind::Codex,
+                accepting_session: Some(receiver),
+                accepting_user: None,
+                owner_filter: OwnerFilter::Any,
+                receiving_cwd: None,
+            })
+            .await
+            .unwrap()
+    );
+    let evidence = store
+        .reader
+        .execution_evidence("exec-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.handoffs_created, 1);
+    assert_eq!(evidence.handoffs_accepted, 1);
+    assert_eq!(
+        evidence.handoff_accepting_session_ids,
+        vec![receiver.to_string()]
+    );
+    assert!(
+        !serde_json::to_string(&evidence)
+            .unwrap()
+            .contains("PRIVATE_HANDOFF")
+    );
 
     let mut drifted = correlation;
     drifted.taskblu_execution_id = Some("exec-2".into());
