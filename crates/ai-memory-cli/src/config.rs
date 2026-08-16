@@ -119,6 +119,9 @@ pub struct Config {
     /// `std::env::var` call (invariant: one config-read path).
     #[serde(default)]
     pub base_path: String,
+    /// Enable server-side project membership authorization for MCP, hooks and
+    /// web/API transports. Disabled preserves historical single-tenant mode.
+    pub project_acl_enabled: bool,
     /// Operator home directory, captured once here (the single config-read
     /// path) from `AI_MEMORY_HOME` or `$HOME`. Used to keep the cwd->project resolver and the
     /// startup heal from treating `$HOME` as a prefix-match catch-all
@@ -490,6 +493,7 @@ impl Default for Config {
             bind: DEFAULT_BIND.into(),
             server_url: DEFAULT_SERVER_URL.into(),
             base_path: String::new(),
+            project_acl_enabled: false,
             home_dir: None,
             log_level: "info".into(),
             llm_provider: None,

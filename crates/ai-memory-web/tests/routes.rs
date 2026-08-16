@@ -3,9 +3,9 @@
 //! Spins up a `Store` + `Wiki` in a tempdir, seeds two pages, builds
 //! the router, and exercises each route via `tower::ServiceExt::oneshot`.
 
-use ai_memory_core::{AgentKind, NewHandoff, NewPage, PagePath, Tier};
-use ai_memory_store::Store;
-use ai_memory_web::{api_router, router};
+use ai_memory_core::{AgentKind, AuthLevel, NewHandoff, NewPage, NewUser, PagePath, Tier};
+use ai_memory_store::{ProjectRole, Store};
+use ai_memory_web::{api_router, api_router_with_acl, router, router_with_acl};
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
@@ -18,6 +18,135 @@ async fn setup() -> (TempDir, Store, Wiki) {
     let store = Store::open(tmp.path()).unwrap();
     let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
     (tmp, store, wiki)
+}
+
+#[tokio::test]
+async fn project_acl_protects_api_and_filters_global_search() {
+    let (_tmp, store, wiki) = setup().await;
+    let workspace = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let allowed = store
+        .writer
+        .get_or_create_project(workspace, "allowed", None)
+        .await
+        .unwrap();
+    let denied = store
+        .writer
+        .get_or_create_project(workspace, "denied", None)
+        .await
+        .unwrap();
+    for (project_id, path) in [(allowed, "visible.md"), (denied, "hidden.md")] {
+        store
+            .writer
+            .upsert_page(new_page(
+                workspace,
+                project_id,
+                path,
+                path,
+                "web-acl-marker",
+            ))
+            .await
+            .unwrap();
+    }
+    let mut user = NewUser {
+        username: "web-acl-user".into(),
+        name: None,
+        email: None,
+    };
+    user.validate().unwrap();
+    let user_id = store.writer.create_user(user, [4; 32]).await.unwrap();
+    let app = api_router_with_acl(store.reader.clone(), wiki, true);
+
+    let mut denied_request = Request::builder()
+        .uri("/workspaces/default/projects/allowed/pages")
+        .body(Body::empty())
+        .unwrap();
+    denied_request.extensions_mut().insert(AuthLevel::User);
+    denied_request.extensions_mut().insert(user_id);
+    assert_eq!(
+        app.clone().oneshot(denied_request).await.unwrap().status(),
+        StatusCode::NOT_FOUND,
+    );
+
+    store
+        .writer
+        .upsert_project_membership(user_id, workspace, allowed, ProjectRole::Viewer, true)
+        .await
+        .unwrap();
+    let mut search = Request::builder()
+        .method(Method::POST)
+        .uri("/search")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"q":"web-acl-marker"}"#))
+        .unwrap();
+    search.extensions_mut().insert(AuthLevel::User);
+    search.extensions_mut().insert(user_id);
+    let response = app.clone().oneshot(search).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let hits: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["project"], "allowed");
+
+    let mut projects = Request::builder()
+        .uri("/projects")
+        .body(Body::empty())
+        .unwrap();
+    projects.extensions_mut().insert(AuthLevel::User);
+    projects.extensions_mut().insert(user_id);
+    let response = app.clone().oneshot(projects).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let projects: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0]["project_name"], "allowed");
+
+    let mut workspaces = Request::builder()
+        .uri("/workspaces")
+        .body(Body::empty())
+        .unwrap();
+    workspaces.extensions_mut().insert(AuthLevel::User);
+    workspaces.extensions_mut().insert(user_id);
+    let response = app.oneshot(workspaces).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let workspaces: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(workspaces.len(), 1);
+    assert_eq!(workspaces[0]["project_count"], 1);
+
+    let html = router_with_acl(
+        store.reader.clone(),
+        Wiki::new(_tmp.path(), store.writer.clone()).unwrap(),
+        true,
+    );
+    let mut index = Request::builder().uri("/").body(Body::empty()).unwrap();
+    index.extensions_mut().insert(AuthLevel::User);
+    index.extensions_mut().insert(user_id);
+    let response = html.clone().oneshot(index).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = std::str::from_utf8(&body).unwrap();
+    assert!(body.contains("allowed"));
+    assert!(!body.contains("denied"));
+
+    let mut denied_project = Request::builder()
+        .uri("/w/default/denied")
+        .body(Body::empty())
+        .unwrap();
+    denied_project.extensions_mut().insert(AuthLevel::User);
+    denied_project.extensions_mut().insert(user_id);
+    assert_eq!(
+        html.oneshot(denied_project).await.unwrap().status(),
+        StatusCode::NOT_FOUND,
+    );
 }
 
 fn new_page(

@@ -1,6 +1,6 @@
 //! Durable project membership and shared scope-policy contract.
 
-use ai_memory_core::{AuthLevel, NewUser};
+use ai_memory_core::{AuthLevel, NewPage, NewUser, PagePath, Tier};
 use ai_memory_store::{
     AccessAction, AccessDecision, AccessPrincipal, ProjectRole, ScopeAuthorizer, Store,
     TOKEN_HASH_LEN,
@@ -148,4 +148,61 @@ async fn workspace_project_mismatch_is_rejected_by_sql_boundary() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn global_retrieval_applies_membership_before_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let workspace = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let allowed = store
+        .writer
+        .get_or_create_project(workspace, "allowed", None)
+        .await
+        .unwrap();
+    let denied = store
+        .writer
+        .get_or_create_project(workspace, "denied", None)
+        .await
+        .unwrap();
+    for (project_id, path, title) in [
+        (denied, "hidden.md", "Exact marker"),
+        (allowed, "visible.md", "Visible marker"),
+    ] {
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: workspace,
+                project_id,
+                path: PagePath::new(path).unwrap(),
+                title: title.into(),
+                body: "acl-prelimit-marker".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let hits = store
+        .reader
+        .search_pages_with_meta_for_scopes(
+            "acl-prelimit-marker".into(),
+            1,
+            None,
+            vec![(workspace, allowed)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].project_name, "allowed");
 }

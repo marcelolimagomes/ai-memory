@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use ai_memory_store::{AccessAction, AccessDecision, lookup_existing_scope};
 use askama::Template;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -15,7 +16,31 @@ use crate::templates::{Folder, PageRow, ProjectView, humanize, page_href};
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     Path((workspace, project)): Path<(String, String)>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
 ) -> Result<Html<String>, StatusCode> {
+    let scope = lookup_existing_scope(&state.reader, &workspace, &project)
+        .await
+        .map_err(|error| {
+            if error.is_not_found() {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    let decision = state
+        .check_project(
+            auth.map(|axum::Extension(level)| level),
+            user_id.map(|axum::Extension(id)| id),
+            scope.workspace_id,
+            scope.project_id,
+            AccessAction::Read,
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if decision == AccessDecision::Denied {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let pages = state
         .reader
         .list_pages(&workspace, &project)

@@ -19,7 +19,7 @@ use ai_memory_mcp::{
     AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_decay_breadth,
 };
 use ai_memory_store::{ReaderPool, Store, WriterHandle};
-use ai_memory_web::{WebMountSpec, mount_web_router, normalize_prefix, web_base_href};
+use ai_memory_web::{WebMountSpec, mount_web_router_with_acl, normalize_prefix, web_base_href};
 use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -468,7 +468,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_active_project(active_project.clone())
         .with_sanitizer(sanitizer.clone())
         .with_trusted_proxy_identity(trusted_proxy_identity_enabled(&config.auth))
-        .with_per_user_slots(config.slots.per_user);
+        .with_per_user_slots(config.slots.per_user)
+        .with_project_acl(config.project_acl_enabled);
     if let Some(e) = embedder.clone() {
         server = server.with_embedder(e);
     }
@@ -593,6 +594,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 session_consolidation_notify,
                 capture_assistant_enabled: config.capture_assistant,
                 per_user_slots: config.slots.per_user,
+                project_acl_enabled: config.project_acl_enabled,
                 subagent_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
                     ai_memory_hooks::SubagentSessionSet::default(),
                 )),
@@ -728,7 +730,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 );
             }
             let base_href = web_base_href(&args.base_path, &args.web_slug);
-            let router = mount_web_router(
+            let router = mount_web_router_with_acl(
                 router,
                 args.enable_web,
                 store.reader.clone(),
@@ -740,6 +742,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     base_href: &base_href,
                     base_path: &base_path,
                 },
+                config.project_acl_enabled,
             )?;
             let router = apply_http_layers(router, auth_state, config.allowed_hosts.clone());
             // Host the entire surface under the configured base path. Empty

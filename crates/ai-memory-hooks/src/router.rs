@@ -16,10 +16,13 @@ use ai_memory_consolidate::{Consolidator, ConsolidatorError};
 use ai_memory_core::{
     ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
     MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, NewHandoff, NewObservation, NewSession,
-    ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId, WorkstreamEvent,
-    WorkstreamEventKind,
+    ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, UserId, WorkspaceId,
+    WorkstreamEvent, WorkstreamEventKind,
 };
-use ai_memory_store::{IngestObservationOutcome, WriterHandle};
+use ai_memory_store::{
+    AccessAction, AccessDecision, AccessPrincipal, IngestObservationOutcome, ScopeAuthorizer,
+    WriterHandle,
+};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki};
 use axum::Json;
 use axum::Router;
@@ -493,6 +496,9 @@ pub struct HookState {
     pub trusted_proxy_identity: bool,
     /// Namespace slot injection by the qualified request identity.
     pub per_user_slots: bool,
+    /// Whether project memberships are enforced for hook writes and handoff
+    /// reads. Disabled preserves local/single-tenant compatibility.
+    pub project_acl_enabled: bool,
 }
 
 /// The owner to stamp on the session and handoff rows this event creates
@@ -569,17 +575,18 @@ fn admission_skips(
 /// (synchronous handoff-fetch for session-start hooks).
 pub fn hook_router(state: HookState) -> Router {
     Router::new()
-        .route("/hook", post(handle_hook))
-        .route("/hook/batch", post(handle_hook_batch))
-        .route("/handoff", get(handle_handoff))
+        .route("/hook", post(handle_hook_with_identity))
+        .route("/hook/batch", post(handle_hook_batch_with_identity))
+        .route("/handoff", get(handle_handoff_with_identity))
         .with_state(Arc::new(state))
 }
 
-async fn handle_hook(
+async fn handle_hook_with_identity(
     State(state): State<Arc<HookState>>,
     Query(query): Query<HookQuery>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id_ext: Option<axum::Extension<UserId>>,
     headers: HeaderMap,
     Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -605,6 +612,8 @@ async fn handle_hook(
     // extensions — so `process()` can key the `ActiveProject` map by the
     // authenticated identity when `[auto_scope] mode = per_actor` is on.
     let actor = actor_identity(actor_ext);
+    let user_id = user_id_ext.map(|axum::Extension(id)| id);
+    let auth_level = level_ext.as_ref().map(|axum::Extension(level)| *level);
     // Same reason: the skip-list header is read here, while the request
     // extensions still exist, and travels with the event into `process()`.
     let skip_webhooks = admission_skips(level_ext, &headers);
@@ -628,9 +637,21 @@ async fn handle_hook(
     }
     tokio::spawn(async move {
         let _permit = permit;
-        process_envelope(state, env, actor, skip_webhooks).await;
+        process_envelope(state, env, actor, user_id, auth_level, skip_webhooks).await;
     });
     (StatusCode::ACCEPTED, "queued")
+}
+
+#[cfg(test)]
+async fn handle_hook(
+    state: State<Arc<HookState>>,
+    query: Query<HookQuery>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    headers: HeaderMap,
+    body: Json<serde_json::Value>,
+) -> impl IntoResponse {
+    handle_hook_with_identity(state, query, actor_ext, level_ext, None, headers, body).await
 }
 
 /// One event in a `POST /hook/batch` request — the same `{url, body}` pair a
@@ -727,10 +748,11 @@ impl HookBatchAck {
 /// processing errors still fail-fast. Per-source rate-limit misses are different:
 /// the item is skipped and later unrelated sources continue, with
 /// `accepted_indices` telling new spool drains exactly which entries committed.
-async fn handle_hook_batch(
+async fn handle_hook_batch_with_identity(
     State(state): State<Arc<HookState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id_ext: Option<axum::Extension<UserId>>,
     headers: HeaderMap,
     Json(items): Json<Vec<HookBatchItem>>,
 ) -> impl IntoResponse {
@@ -745,6 +767,8 @@ async fn handle_hook_batch(
     // All items in a batch share the drain's single identity, so the actor is
     // captured once from the batch request (mirrors `handle_hook`).
     let actor = actor_identity(actor_ext);
+    let user_id = user_id_ext.map(|axum::Extension(id)| id);
+    let auth_level = level_ext.as_ref().map(|axum::Extension(level)| *level);
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
     let mut accepted_indices = Vec::new();
@@ -794,7 +818,16 @@ async fn handle_hook_batch(
             continue;
         }
         let _permit = permit;
-        if let Err(e) = process(&state, env, actor.clone(), skip_webhooks.clone()).await {
+        if let Err(e) = process_with_user(
+            &state,
+            env,
+            actor.clone(),
+            user_id,
+            auth_level,
+            skip_webhooks.clone(),
+        )
+        .await
+        {
             warn!(error = %e, accepted = accepted_indices.len(), "hook batch item failed; stopping (fail-fast)");
             return (
                 StatusCode::OK,
@@ -807,6 +840,17 @@ async fn handle_hook_batch(
         StatusCode::OK,
         Json(HookBatchAck::indexed_full_scan(accepted_indices)),
     )
+}
+
+#[cfg(test)]
+async fn handle_hook_batch(
+    state: State<Arc<HookState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    headers: HeaderMap,
+    items: Json<Vec<HookBatchItem>>,
+) -> impl IntoResponse {
+    handle_hook_batch_with_identity(state, actor_ext, level_ext, None, headers, items).await
 }
 
 /// Apply the client capture protocol before any admission or store work.
@@ -1149,16 +1193,28 @@ pub struct HandoffQuery {
 /// the response is sent. Two agents starting in parallel therefore
 /// race; whichever arrives first wins. That is intentional — handoffs
 /// are 1:1, not broadcast.
-async fn handle_handoff(
+async fn handle_handoff_with_identity(
     State(state): State<Arc<HookState>>,
     Query(query): Query<HandoffQuery>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id_ext: Option<axum::Extension<UserId>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let actor = actor_identity(actor_ext);
+    let user_id = user_id_ext.map(|axum::Extension(id)| id);
+    let auth_level = level_ext.as_ref().map(|axum::Extension(level)| *level);
     let skip_webhooks = admission_skips(level_ext, &headers);
-    match fetch_and_accept_handoff(&state, query, actor, skip_webhooks).await {
+    match fetch_and_accept_handoff_with_user(
+        &state,
+        query,
+        actor,
+        user_id,
+        auth_level,
+        skip_webhooks,
+    )
+    .await
+    {
         Ok(Some(markdown)) => (StatusCode::OK, markdown),
         Ok(None) => (StatusCode::OK, String::new()),
         Err(e) => {
@@ -1168,10 +1224,33 @@ async fn handle_handoff(
     }
 }
 
+#[cfg(test)]
+async fn handle_handoff(
+    state: State<Arc<HookState>>,
+    query: Query<HandoffQuery>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    handle_handoff_with_identity(state, query, actor_ext, level_ext, None, headers).await
+}
+
+#[cfg(test)]
 async fn fetch_and_accept_handoff(
     state: &HookState,
     query: HandoffQuery,
     actor: Option<IdentityKey>,
+    skip_webhooks: Vec<String>,
+) -> anyhow::Result<Option<String>> {
+    fetch_and_accept_handoff_with_user(state, query, actor, None, None, skip_webhooks).await
+}
+
+async fn fetch_and_accept_handoff_with_user(
+    state: &HookState,
+    query: HandoffQuery,
+    actor: Option<IdentityKey>,
+    user_id: Option<UserId>,
+    auth_level: Option<ai_memory_core::AuthLevel>,
     skip_webhooks: Vec<String>,
 ) -> anyhow::Result<Option<String>> {
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
@@ -1198,6 +1277,25 @@ async fn fetch_and_accept_handoff(
         ProjectStrategy::parse(query.project_strategy.as_deref()),
     )
     .await?;
+    if state.project_acl_enabled {
+        match ScopeAuthorizer::new(true)
+            .check_project(
+                &state.reader,
+                AccessPrincipal::from_auth(auth_level, user_id),
+                ws,
+                proj,
+                AccessAction::Read,
+            )
+            .await?
+        {
+            AccessDecision::Allowed => {}
+            AccessDecision::Denied => {
+                return Err(anyhow::anyhow!(
+                    "active project membership does not permit handoff access"
+                ));
+            }
+        }
+    }
     // Session-start handoff delivery is a foreground action. Publish it so
     // static MCP callers resolve to the directory that is opening now. The
     // query carries no recall preference; the main capture path publishes
@@ -2062,9 +2160,12 @@ async fn process_envelope(
     state: Arc<HookState>,
     env: HookEnvelope,
     actor: Option<IdentityKey>,
+    user_id: Option<UserId>,
+    auth_level: Option<ai_memory_core::AuthLevel>,
     skip_webhooks: Vec<String>,
 ) {
-    if let Err(e) = process(&state, env, actor, skip_webhooks).await {
+    if let Err(e) = process_with_user(&state, env, actor, user_id, auth_level, skip_webhooks).await
+    {
         warn!(error = %e, "hook processing failed");
     }
 }
@@ -2128,12 +2229,24 @@ fn publish_active_project_for_event(
     }
 }
 
+#[cfg(test)]
 async fn process(
     state: &HookState,
     env: HookEnvelope,
     actor: Option<IdentityKey>,
     // Admission webhooks this request opted out of (see `admission_skips`).
     // Empty for every caller with no HTTP request behind it.
+    skip_webhooks: Vec<String>,
+) -> anyhow::Result<()> {
+    process_with_user(state, env, actor, None, None, skip_webhooks).await
+}
+
+async fn process_with_user(
+    state: &HookState,
+    env: HookEnvelope,
+    actor: Option<IdentityKey>,
+    user_id: Option<UserId>,
+    auth_level: Option<ai_memory_core::AuthLevel>,
     skip_webhooks: Vec<String>,
 ) -> anyhow::Result<()> {
     let session_id = resolve_session_id(&env)?;
@@ -2199,6 +2312,26 @@ async fn process(
             .await?
         }
     };
+
+    if state.project_acl_enabled {
+        match ScopeAuthorizer::new(true)
+            .check_project(
+                &state.reader,
+                AccessPrincipal::from_auth(auth_level, user_id),
+                ws,
+                proj,
+                AccessAction::Write,
+            )
+            .await?
+        {
+            AccessDecision::Allowed => {}
+            AccessDecision::Denied => {
+                return Err(anyhow::anyhow!(
+                    "active project membership does not permit hook ingestion"
+                ));
+            }
+        }
+    }
 
     if matches!(env.event, HookEvent::SessionEnd) {
         match state
@@ -3030,6 +3163,7 @@ mod tests {
             )),
             ingest_gates: IngestGates::default(),
             per_user_slots: false,
+            project_acl_enabled: false,
         }
     }
 
@@ -3069,6 +3203,77 @@ mod tests {
             .await
             .unwrap();
         session_id
+    }
+
+    #[tokio::test]
+    async fn project_acl_gates_hook_ingestion_before_session_creation() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.project_acl_enabled = true;
+        let mut user = ai_memory_core::NewUser {
+            username: "hook-acl-user".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        let user_id = state.writer.create_user(user, [5; 32]).await.unwrap();
+        let session_id = SessionId::new();
+        let denied = process_with_user(
+            &state,
+            session_envelope(
+                "user-prompt-submit",
+                &session_id.to_string(),
+                "/tmp/scratch",
+            ),
+            None,
+            Some(user_id),
+            Some(ai_memory_core::AuthLevel::User),
+            Vec::new(),
+        )
+        .await;
+        assert!(denied.is_err());
+        assert!(
+            state
+                .reader
+                .find_session_scope(session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        state
+            .writer
+            .upsert_project_membership(
+                user_id,
+                state.workspace_id,
+                state.project_id,
+                ai_memory_store::ProjectRole::Contributor,
+                true,
+            )
+            .await
+            .unwrap();
+        process_with_user(
+            &state,
+            session_envelope(
+                "user-prompt-submit",
+                &session_id.to_string(),
+                "/tmp/scratch",
+            ),
+            None,
+            Some(user_id),
+            Some(ai_memory_core::AuthLevel::User),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            state
+                .reader
+                .find_session_scope(session_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// Regression: a configured-but-failing LLM used to make PreCompact

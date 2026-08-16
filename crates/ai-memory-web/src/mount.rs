@@ -307,6 +307,18 @@ pub fn mount_web_router(
     wiki: Wiki,
     spec: WebMountSpec<'_>,
 ) -> Result<axum::Router> {
+    mount_web_router_with_acl(router, enable_web, reader, wiki, spec, false)
+}
+
+/// Mount web/API surfaces with shared project authorization.
+pub fn mount_web_router_with_acl(
+    router: axum::Router,
+    enable_web: bool,
+    reader: ReaderPool,
+    wiki: Wiki,
+    spec: WebMountSpec<'_>,
+    project_acl_enabled: bool,
+) -> Result<axum::Router> {
     if !enable_web {
         return Ok(router);
     }
@@ -315,7 +327,7 @@ pub fn mount_web_router(
     // call; nesting after the layer would silently bypass auth for /web/*.
     let router = router.nest(
         "/api/v1",
-        build_api_router(&reader, &wiki, spec.cors_origins),
+        build_api_router(&reader, &wiki, spec.cors_origins, project_acl_enabled),
     );
 
     // Where the UI is mounted WITHIN the (already-applied) base path.
@@ -337,6 +349,7 @@ pub fn mount_web_router(
         &slug,
         spec.base_href,
         mount,
+        project_acl_enabled,
     ))
 }
 
@@ -344,8 +357,13 @@ pub fn mount_web_router(
 /// the operator configured any. The layer is scoped to this router only
 /// (CORS_NOT_APPLIED_TO_OTHER_ROUTES invariant — `/mcp`, `/hook`,
 /// `/admin`, and `/web` must remain CORS-free).
-fn build_api_router(reader: &ReaderPool, wiki: &Wiki, cors_origins: &[String]) -> axum::Router {
-    let api = crate::api_router(reader.clone(), wiki.clone());
+fn build_api_router(
+    reader: &ReaderPool,
+    wiki: &Wiki,
+    cors_origins: &[String],
+    project_acl_enabled: bool,
+) -> axum::Router {
+    let api = crate::api_router_with_acl(reader.clone(), wiki.clone(), project_acl_enabled);
     if cors_origins.is_empty() {
         return api;
     }
@@ -418,15 +436,15 @@ fn mount_builtin_browser(
     slug: &str,
     base_href: &str,
     mount: &str,
+    project_acl_enabled: bool,
 ) -> axum::Router {
     // The built-in browser emits RELATIVE asset/link URLs (`static/…`,
     // `w/…`, `search`, `.`). Inject a `<base href>` into every HTML
     // response so they resolve under `{base_path}{web_slug}/` — the
     // same anchoring the custom SPA gets via its injected index.
-    let web_router = crate::router(reader, wiki).layer(axum::middleware::from_fn_with_state(
-        Arc::new(base_href.to_string()),
-        inject_web_base_href,
-    ));
+    let web_router = crate::router_with_acl(reader, wiki, project_acl_enabled).layer(
+        axum::middleware::from_fn_with_state(Arc::new(base_href.to_string()), inject_web_base_href),
+    );
     info!(mount, base_href, "read-only wiki browser mounted");
     if slug.is_empty() {
         return router.merge(web_router);

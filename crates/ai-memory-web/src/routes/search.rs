@@ -24,17 +24,36 @@ pub(crate) struct SearchParams {
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     Query(params): Query<SearchParams>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
 ) -> Result<Html<String>, StatusCode> {
     let query = params.q.trim().to_owned();
+    let scopes = state
+        .visible_project_scopes(
+            auth.map(|axum::Extension(level)| level),
+            user_id.map(|axum::Extension(id)| id),
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let hits = if query.is_empty() {
         Vec::new()
     } else {
-        let raw = state
-            .reader
-            .search_pages_with_meta(query.clone(), 50, None)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let raw = match scopes {
+            None => {
+                state
+                    .reader
+                    .search_pages_with_meta(query.clone(), 50, None)
+                    .await
+            }
+            Some(scopes) => {
+                state
+                    .reader
+                    .search_pages_with_meta_for_scopes(query.clone(), 50, None, scopes)
+                    .await
+            }
+        }
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let mut results = Vec::with_capacity(raw.len());
         for h in raw {

@@ -35,6 +35,11 @@ log_level = "info"
 # --capture-assistant`. Env equivalent: `AI_MEMORY_CAPTURE_ASSISTANT=true`.
 # capture_assistant = false
 
+# Enforce durable project memberships at MCP, hook and web/API seams. HTTP
+# users without an active role fail closed; local stdio remains compatible.
+# Env equivalent: `AI_MEMORY_PROJECT_ACL_ENABLED=true`.
+# project_acl_enabled = false
+
 # Optional final LLM relevance pass for project/scopes memory_query calls.
 # Requires an LLM provider and adds at most one provider call per eligible
 # query. The bounded query, page titles, and search snippets are sent to that

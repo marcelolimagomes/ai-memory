@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use ai_memory_core::PagePath;
+use ai_memory_store::{AccessAction, AccessDecision, lookup_existing_scope};
 use askama::Template;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -16,7 +17,35 @@ use crate::templates::{NotFoundView, PageView, humanize, page_href, project_href
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     Path((workspace, project, path)): Path<(String, String, String)>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
 ) -> Response {
+    let scope = match lookup_existing_scope(&state.reader, &workspace, &project).await {
+        Ok(scope) => scope,
+        Err(error) => {
+            return if error.is_not_found() {
+                not_found_response()
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            };
+        }
+    };
+    let decision = match state
+        .check_project(
+            auth.map(|axum::Extension(level)| level),
+            user_id.map(|axum::Extension(id)| id),
+            scope.workspace_id,
+            scope.project_id,
+            AccessAction::Read,
+        )
+        .await
+    {
+        Ok(decision) => decision,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if decision == AccessDecision::Denied {
+        return not_found_response();
+    }
     let meta = match state.reader.page_meta(&workspace, &project, &path).await {
         Ok(Some(m)) => m,
         Ok(None) => return not_found_response(),

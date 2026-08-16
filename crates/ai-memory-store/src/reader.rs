@@ -1272,6 +1272,85 @@ impl ReaderPool {
         .await
     }
 
+    /// Run global full-text search against an explicit project allowlist.
+    /// Scope predicates are evaluated before ranking and limiting.
+    pub async fn search_pages_with_meta_for_scopes(
+        &self,
+        query: String,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+        scopes: Vec<(WorkspaceId, ProjectId)>,
+    ) -> StoreResult<Vec<PageHitWithMeta>> {
+        let fts_query = normalize_fts_query(&query);
+        if fts_query.is_empty() || limit == 0 || scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
+            let mut scope_predicate = String::new();
+            let mut values = vec![
+                Value::Text(fts_query),
+                Value::Integer(authority_candidate_limit(limit) as i64),
+                Value::Integer(cutoff),
+            ];
+            for (index, (workspace_id, project_id)) in scopes.into_iter().enumerate() {
+                if index > 0 {
+                    scope_predicate.push_str(" OR ");
+                }
+                let workspace_param = 4 + index * 2;
+                let project_param = workspace_param + 1;
+                let _ = write!(
+                    scope_predicate,
+                    "(pages.workspace_id = ?{workspace_param} AND pages.project_id = ?{project_param})"
+                );
+                values.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+                values.push(Value::Blob(project_id.as_bytes().to_vec()));
+            }
+            let sql = format!(
+                "SELECT workspaces.name, projects.name, pages.path, pages.title, \
+                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24), \
+                        pages_fts.rank, pages.tier, pages.pinned, \
+                        pages.frontmatter_json, {kind_expr} \
+                 FROM pages_fts \
+                 JOIN pages ON pages.rowid = pages_fts.rowid \
+                 JOIN projects ON projects.id = pages.project_id \
+                 JOIN workspaces ON workspaces.id = pages.workspace_id \
+                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired} \
+                   AND ({scope_predicate}) \
+                 ORDER BY pages_fts.rank LIMIT ?2",
+                not_expired = not_expired("pages", "?3"),
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?, row.get::<_, f64>(5)?,
+                    row.get::<_, String>(6)?, row.get::<_, i64>(7)? != 0,
+                    row.get::<_, String>(8)?, row.get::<_, String>(9)?,
+                ))
+            })?;
+            let mut candidates = Vec::new();
+            for row in rows {
+                let (workspace_name, project_name, path, title, snippet, rank, tier, pinned, frontmatter_json, kind) = row?;
+                let authority = PageAuthority::from_stored(
+                    &path, &kind, &tier, pinned, &frontmatter_json,
+                );
+                candidates.push((PageHitWithMeta {
+                    workspace_name,
+                    project_name,
+                    path: PagePath::new(path)?,
+                    title,
+                    snippet,
+                    rank,
+                }, authority));
+            }
+            Ok(rerank_page_hits_with_meta(candidates, limit))
+        })
+        .await
+    }
+
     /// Run an authority-adjusted full-text search scoped to one project.
     ///
     /// `expiry_cutoff_us`: `None` hides pages whose TTL has passed as of
@@ -1601,6 +1680,67 @@ impl ReaderPool {
                 let snippet: String = row.get(4)?;
                 let rank: f64 = row.get(5)?;
                 Ok((workspace_name, project_name, path, title, snippet, rank))
+            })?;
+            let mut hits = Vec::new();
+            for row in rows {
+                let (workspace_name, project_name, path, title, snippet, rank) = row?;
+                hits.push(PageHitWithMeta {
+                    workspace_name,
+                    project_name,
+                    path: PagePath::new(path)?,
+                    title,
+                    snippet,
+                    rank,
+                });
+            }
+            Ok(hits)
+        })
+        .await
+    }
+
+    /// Return recent pages from an explicit allowlist, applying scope before
+    /// the recency limit.
+    pub async fn recent_pages_global_for_scopes(
+        &self,
+        limit: usize,
+        scopes: Vec<(WorkspaceId, ProjectId)>,
+    ) -> StoreResult<Vec<PageHitWithMeta>> {
+        if limit == 0 || scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(move |conn| {
+            let mut scope_predicate = String::new();
+            let mut values = vec![Value::Integer(limit as i64), Value::Integer(now_us())];
+            for (index, (workspace_id, project_id)) in scopes.into_iter().enumerate() {
+                if index > 0 {
+                    scope_predicate.push_str(" OR ");
+                }
+                let workspace_param = 3 + index * 2;
+                let project_param = workspace_param + 1;
+                let _ = write!(
+                    scope_predicate,
+                    "(pages.workspace_id = ?{workspace_param} AND pages.project_id = ?{project_param})"
+                );
+                values.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+                values.push(Value::Blob(project_id.as_bytes().to_vec()));
+            }
+            let sql = format!(
+                "SELECT workspaces.name, projects.name, pages.path, pages.title, \
+                        substr(pages.body, 1, 240), CAST(pages.updated_at AS REAL) \
+                 FROM pages \
+                 JOIN projects ON projects.id = pages.project_id \
+                 JOIN workspaces ON workspaces.id = pages.workspace_id \
+                 WHERE pages.is_latest = 1{not_expired} AND ({scope_predicate}) \
+                 ORDER BY pages.updated_at DESC LIMIT ?1",
+                not_expired = not_expired("pages", "?2"),
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?, row.get::<_, f64>(5)?,
+                ))
             })?;
             let mut hits = Vec::new();
             for row in rows {

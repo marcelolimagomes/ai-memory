@@ -15,11 +15,15 @@ use ai_memory_core::{
 };
 use ai_memory_llm::{Embedder, LlmProvider};
 use ai_memory_store::{
+    AccessAction, AccessDecision, AccessPrincipal, DecayParams, PageHit, ReaderPool,
+    ScopeAuthorizer, ScopeName, ScopeResolver, WriterHandle, lookup_existing_scope,
+    lookup_global_scope,
+};
+use ai_memory_store::{
     AutoImproveProposalOperation, CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY,
     CLIENT_ACTIVITY_MAX_NAME_CHARS, CLIENT_ACTIVITY_OVERFLOW_CLIENT, NewAutoImproveProposal,
-    StageAutoImproveRun,
+    ProjectRole, StageAutoImproveRun,
 };
-use ai_memory_store::{DecayParams, PageHit, ReaderPool, ScopeName, ScopeResolver, WriterHandle};
 use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -431,6 +435,9 @@ pub struct AiMemoryServer {
     /// default, and every deployment that never sets the flag — means a nested
     /// slot path is an ordinary shared page, so both stay exactly as they were.
     per_user_slots: bool,
+    /// Whether active project memberships are enforced at MCP read/write
+    /// seams. Disabled preserves local/stdio compatibility.
+    project_acl_enabled: bool,
     // Read by the `#[tool_handler]` macro expansion; rustc's dead-code
     // analysis can't see that, so the lint must be allowed explicitly.
     #[allow(dead_code)]
@@ -514,6 +521,25 @@ struct StatusArgs {
     /// current/default workspace resolution chain.
     #[serde(default)]
     workspace: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ProjectMembershipSetArgs {
+    /// Existing registered ai-memory username.
+    username: String,
+    /// Existing workspace name.
+    workspace: String,
+    /// Existing project name inside the workspace.
+    project: String,
+    /// `viewer`, `contributor`, `curator`, or `owner`.
+    role: String,
+    /// False suspends access without deleting provenance.
+    #[serde(default = "default_membership_active")]
+    active: bool,
+}
+
+fn default_membership_active() -> bool {
+    true
 }
 
 /// One `memory_query` hit; serializes exactly like a bare
@@ -1198,6 +1224,7 @@ impl AiMemoryServer {
             access_bump_seen: Arc::new(Mutex::new(HashMap::new())),
             trusted_proxy_identity: false,
             per_user_slots: false,
+            project_acl_enabled: false,
             tool_router: Self::tool_router(),
         }
     }
@@ -1218,6 +1245,13 @@ impl AiMemoryServer {
     #[must_use]
     pub fn with_per_user_slots(mut self, enabled: bool) -> Self {
         self.per_user_slots = enabled;
+        self
+    }
+
+    /// Enable project-membership authorization for MCP operations.
+    #[must_use]
+    pub fn with_project_acl(mut self, enabled: bool) -> Self {
+        self.project_acl_enabled = enabled;
         self
     }
 
@@ -1763,15 +1797,28 @@ impl AiMemoryServer {
                     None,
                 ));
             }
-            let global_hits = self
-                .reader
-                .search_pages_with_meta(
-                    args.query.clone(),
-                    limit,
-                    include_expired.then_some(i64::MIN),
-                )
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let global_hits = match self.authorized_global_scopes(&parts).await? {
+                None => {
+                    self.reader
+                        .search_pages_with_meta(
+                            args.query.clone(),
+                            limit,
+                            include_expired.then_some(i64::MIN),
+                        )
+                        .await
+                }
+                Some(scopes) => {
+                    self.reader
+                        .search_pages_with_meta_for_scopes(
+                            args.query.clone(),
+                            limit,
+                            include_expired.then_some(i64::MIN),
+                            scopes,
+                        )
+                        .await
+                }
+            }
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             return ok_json(&MemoryQueryResponse {
                 hits: Vec::new(),
                 raw_hits: Vec::new(),
@@ -1804,6 +1851,12 @@ impl AiMemoryServer {
         } else {
             Some(self.resolve_query_scopes(&args.scopes).await?)
         };
+        if let Some(scopes) = &resolved_scopes {
+            for &(workspace_id, project_id) in scopes {
+                self.require_project_action(&parts, workspace_id, project_id, AccessAction::Read)
+                    .await?;
+            }
+        }
         let hits = if let Some(scopes) = &resolved_scopes {
             let mut hits_by_id: HashMap<PageId, (PageHit, Option<ai_memory_store::SearchExplain>)> =
                 HashMap::new();
@@ -1851,6 +1904,8 @@ impl AiMemoryServer {
                     args.project.as_deref(),
                     &aps_actor,
                 )
+                .await?;
+            self.require_project_action(&parts, ws, proj, AccessAction::Read)
                 .await?;
             self.search_project(
                 ws,
@@ -2009,11 +2064,15 @@ impl AiMemoryServer {
         let explicit_scoping =
             named_scope_args_present(args.workspace.as_deref(), args.project.as_deref());
         if !explicit_scoping && self.active_project.default_global_for(&aps_actor) {
-            let global_hits = self
-                .reader
-                .recent_pages_global(limit)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let global_hits = match self.authorized_global_scopes(&parts).await? {
+                None => self.reader.recent_pages_global(limit).await,
+                Some(scopes) => {
+                    self.reader
+                        .recent_pages_global_for_scopes(limit, scopes)
+                        .await
+                }
+            }
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             return ok_json(&MemoryRecentResponse {
                 hits: Vec::new(),
                 global_hits,
@@ -2025,6 +2084,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Read)
             .await?;
         let hits = self
             .reader
@@ -2071,6 +2132,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Write)
             .await?;
         // The reason is free-text from the model; scrub it on the way in
         // like any other caller-supplied body.
@@ -2276,6 +2339,74 @@ impl AiMemoryServer {
             .map_err(|e| McpError::invalid_request(e.message().to_string(), None))
     }
 
+    fn access_principal(parts: &axum::http::request::Parts) -> AccessPrincipal {
+        AccessPrincipal::from_auth(
+            parts.extensions.get::<ai_memory_core::AuthLevel>().copied(),
+            parts.extensions.get::<ai_memory_core::UserId>().copied(),
+        )
+    }
+
+    async fn require_project_action(
+        &self,
+        parts: &axum::http::request::Parts,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        action: AccessAction,
+    ) -> Result<(), McpError> {
+        match ScopeAuthorizer::new(self.project_acl_enabled)
+            .check_project(
+                &self.reader,
+                Self::access_principal(parts),
+                workspace_id,
+                project_id,
+                action,
+            )
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+        {
+            AccessDecision::Allowed => Ok(()),
+            AccessDecision::Denied => Err(McpError::invalid_request(
+                "active project membership does not permit this operation",
+                None,
+            )),
+        }
+    }
+
+    async fn require_global_read(
+        &self,
+        parts: &axum::http::request::Parts,
+    ) -> Result<(), McpError> {
+        match ScopeAuthorizer::new(self.project_acl_enabled)
+            .check_global_read(Self::access_principal(parts))
+        {
+            AccessDecision::Allowed => Ok(()),
+            AccessDecision::Denied => Err(McpError::invalid_request(
+                "global repository access requires an authenticated user",
+                None,
+            )),
+        }
+    }
+
+    async fn authorized_global_scopes(
+        &self,
+        parts: &axum::http::request::Parts,
+    ) -> Result<Option<Vec<(WorkspaceId, ProjectId)>>, McpError> {
+        self.require_global_read(parts).await?;
+        let mut scopes = ScopeAuthorizer::new(self.project_acl_enabled)
+            .visible_project_scopes(&self.reader, Self::access_principal(parts))
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        if let Some(scopes) = scopes.as_mut()
+            && let Some(global) = lookup_global_scope(&self.reader)
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            && !scopes.contains(&global.as_tuple())
+        {
+            scopes.push(global.as_tuple());
+        }
+        Ok(scopes)
+    }
+
     /// Run the M8 forget sweep over episodic pages.
     #[tool(description = "Run the retention sweep: walk is_latest=1 \
         episodic pages, score them with the agentmemory-style retention \
@@ -2299,6 +2430,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Read)
             .await?;
         let report = run_sweep_with_breadth(
             &self.reader,
@@ -2338,6 +2471,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Write)
             .await?;
         let report = run_lint(
             &self.reader,
@@ -2726,12 +2861,16 @@ impl AiMemoryServer {
         let path = self.place_slot_write(path, &parts).await?;
         let (ws, proj) = match args.scope.as_deref().map(str::trim) {
             None | Some("") => {
-                self.write_target_ids_with_actor(
-                    args.workspace.as_deref(),
-                    args.project.as_deref(),
-                    &aps_actor,
-                )
-                .await?
+                let target = self
+                    .write_target_ids_with_actor(
+                        args.workspace.as_deref(),
+                        args.project.as_deref(),
+                        &aps_actor,
+                    )
+                    .await?;
+                self.require_project_action(&parts, target.0, target.1, AccessAction::Write)
+                    .await?;
+                target
             }
             Some("global") => {
                 if args
@@ -2747,6 +2886,9 @@ impl AiMemoryServer {
                         "scope: \"global\" cannot be combined with workspace/project",
                         None,
                     ));
+                }
+                if self.project_acl_enabled {
+                    self.require_admin_capability(&parts).await?;
                 }
                 ai_memory_store::create_global_scope(&self.writer)
                     .await
@@ -2883,6 +3025,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Read)
             .await?;
         // Diagnose cross-project scope-bleed: a read with no explicit scope
         // resolves to the active project, which may differ from the scope a
@@ -3026,6 +3170,8 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Write)
+            .await?;
 
         // Carry actor identity + loop-prevention skip list (same as write_page).
         // `Wiki::delete_page` stamps `op = Delete` regardless of what we pass.
@@ -3103,6 +3249,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Write)
             .await?;
         let open_questions = cap_handoff_list(
             args.open_questions.iter().map(|q| s.scrub(q)),
@@ -3202,6 +3350,8 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Write)
+            .await?;
         let actor_user = crate::actor::actor_from_parts(&parts)
             .identity_key()
             .map(|key| key.storage_key());
@@ -3294,6 +3444,8 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Write)
+            .await?;
         // Resolve the cross-owner escape hatch before reading the object. A
         // non-admin request must not trigger admission webhooks or learn that
         // another operator's exact id exists.
@@ -3365,6 +3517,8 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Read)
+            .await?;
         let counts = self
             .reader
             .status_counts_for_project(ws, proj)
@@ -3397,6 +3551,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Read)
             .await?;
         let actor = crate::actor::actor_from_parts(&parts);
         let visibility = self.slot_visibility_for(&parts);
@@ -3441,6 +3597,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Read)
             .await?;
         let actor = crate::actor::actor_from_parts(&parts);
         let visibility = self.slot_visibility_for(&parts);
@@ -3573,6 +3731,46 @@ impl AiMemoryServer {
             ]
         });
         ok_json(&response)
+    }
+
+    /// Grant, update, or suspend one registered user's project membership.
+    #[tool(
+        description = "Set a user's project membership. Administrator capability is required. The project must already exist; use role viewer, contributor, curator or owner. active=false suspends access without deleting provenance."
+    )]
+    async fn memory_project_membership_set(
+        &self,
+        Parameters(args): Parameters<ProjectMembershipSetArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        self.require_admin_capability(&parts).await?;
+        let role = ProjectRole::parse(&args.role)
+            .map_err(|error| McpError::invalid_request(error.to_string(), None))?;
+        let scope = lookup_existing_scope(&self.reader, &args.workspace, &args.project)
+            .await
+            .map_err(Self::scope_error)?;
+        let user = self
+            .reader
+            .find_user_by_username(args.username.clone())
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .ok_or_else(|| McpError::invalid_request("registered user not found", None))?;
+        self.writer
+            .upsert_project_membership(
+                user.id,
+                scope.workspace_id,
+                scope.project_id,
+                role,
+                args.active,
+            )
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        ok_json(&serde_json::json!({
+            "username": user.username,
+            "workspace": args.workspace,
+            "project": args.project,
+            "role": role.as_str(),
+            "active": args.active,
+        }))
     }
 }
 
@@ -9949,5 +10147,125 @@ mod tests {
         let locked = buffer.lock().unwrap();
         assert!(locked.pending.is_empty());
         assert!(!locked.flush_scheduled);
+    }
+
+    #[tokio::test]
+    async fn project_acl_denies_non_members_and_filters_global_search() {
+        let (tmp, store, server, workspace, allowed_project) = setup_server().await;
+        let denied_project = store
+            .writer
+            .get_or_create_project(workspace, "denied", None)
+            .await
+            .unwrap();
+        for (project_id, path) in [
+            (allowed_project, "allowed.md"),
+            (denied_project, "denied.md"),
+        ] {
+            store
+                .writer
+                .upsert_page(NewPage {
+                    workspace_id: workspace,
+                    project_id,
+                    path: PagePath::new(path).unwrap(),
+                    title: path.into(),
+                    body: "mcp-acl-marker".into(),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                    expires_at: None,
+                    entities: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        let mut user = ai_memory_core::NewUser {
+            username: "mcp-acl-user".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        let user_id = store.writer.create_user(user, [3; 32]).await.unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = server.with_wiki(wiki).with_project_acl(true);
+        let mut parts = test_parts_default();
+        parts.extensions.insert(AuthLevel::User);
+        parts.extensions.insert(user_id);
+
+        let denied = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "mcp-acl-marker".into(),
+                    limit: Some(10),
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                    scopes: Vec::new(),
+                    global: None,
+                    include_expired: None,
+                    explain: None,
+                }),
+                OptionalParts(parts.clone()),
+            )
+            .await;
+        assert!(denied.is_err());
+
+        server
+            .memory_project_membership_set(
+                Parameters(ProjectMembershipSetArgs {
+                    username: "mcp-acl-user".into(),
+                    workspace: "default".into(),
+                    project: "scratch".into(),
+                    role: "viewer".into(),
+                    active: true,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let global = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "mcp-acl-marker".into(),
+                    limit: Some(10),
+                    project: None,
+                    workspace: None,
+                    scopes: Vec::new(),
+                    global: Some(true),
+                    include_expired: None,
+                    explain: None,
+                }),
+                OptionalParts(parts),
+            )
+            .await
+            .unwrap();
+        let hits = call_tool_json(global)["global_hits"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["project_name"], "scratch");
+
+        let mut viewer_parts = test_parts_default();
+        viewer_parts.extensions.insert(AuthLevel::User);
+        viewer_parts.extensions.insert(user_id);
+        let write = server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/denied.md".into(),
+                    body: "# Denied".into(),
+                    title: None,
+                    tier: None,
+                    tags: Vec::new(),
+                    pinned: false,
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                    scope: None,
+                    expires_at: None,
+                }),
+                OptionalParts(viewer_parts),
+            )
+            .await;
+        assert!(write.is_err(), "viewer membership must not permit writes");
     }
 }
