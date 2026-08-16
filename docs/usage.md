@@ -48,6 +48,13 @@ project. Root-authorized recovery can pass `any_owner: true` to
 `memory_handoff_accept` or `memory_handoff_cancel`; normal callers cannot use
 that switch.
 
+Clients such as Hermes that deliberately discard SessionStart hook output
+must call `memory_handoff_accept` explicitly. A Taskblu launcher also sends
+`X-Taskblu-Execution-Id`; the server then records the accepting native session
+only when the durable hook receipts identify exactly one session in the same
+project. Missing, cross-project, or concurrent/ambiguous correlation is
+rejected rather than attributed heuristically.
+
 Handoffs are next-session transfer, not a live message bus between agents that
 are still running. In particular, Antigravity CLI exposes `PreInvocation`
 before every model call; ai-memory fetches a handoff only on invocation zero,

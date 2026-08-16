@@ -1080,6 +1080,41 @@ struct Inner {
 }
 
 impl ReaderPool {
+    /// Resolve the single native session correlated to an execution in one
+    /// project. A missing receipt is `None`; more than one distinct session is
+    /// rejected so callers never guess which concurrent session consumed a
+    /// single-use handoff.
+    pub async fn execution_session_for_project(
+        &self,
+        execution_id: &str,
+        project_id: ProjectId,
+    ) -> StoreResult<Option<(SessionId, AgentKind)>> {
+        let execution_id = execution_id.to_owned();
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT i.session_id, s.agent_kind FROM ingest_keys i \
+                 JOIN sessions s ON s.id = i.session_id \
+                 WHERE i.taskblu_execution_id = ?1 AND i.project_id = ?2 \
+                   AND i.session_id IS NOT NULL ORDER BY i.session_id LIMIT 2",
+            )?;
+            let rows = stmt
+                .query_map(params![execution_id, project_id.as_bytes()], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            match rows.as_slice() {
+                [] => Ok(None),
+                [(id, agent)] => SessionId::from_slice(id)
+                    .map(|id| Some((id, AgentKind::from_wire(agent))))
+                    .map_err(StoreError::from),
+                _ => Err(StoreError::InvalidState(format!(
+                    "execution '{execution_id}' is correlated to multiple sessions in one project"
+                ))),
+            }
+        })
+        .await
+    }
+
     /// Return metadata-only durable evidence for one TaskBlu execution.
     pub async fn execution_evidence(
         &self,

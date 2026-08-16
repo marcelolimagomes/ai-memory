@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- MCP handoff acceptance now binds `X-Taskblu-Execution-Id` to the single
+  native session already recorded for that execution and project. Missing or
+  ambiguous correlations fail closed, so Hermes-style clients that cannot
+  consume SessionStart output leave metadata-only evidence of the actual
+  receiving session instead of an unattributed acceptance (#389).
+
 ## [1.26.0] - 2026-08-12
 
 ### Added

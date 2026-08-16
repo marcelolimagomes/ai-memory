@@ -179,3 +179,120 @@ async fn correlated_ingest_is_metadata_only_and_rejects_execution_drift() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn execution_session_lookup_is_project_scoped_and_fails_closed_when_ambiguous() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let workspace = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(workspace, "evidence", None)
+        .await
+        .unwrap();
+    let other_project = store
+        .writer
+        .get_or_create_project(workspace, "other", None)
+        .await
+        .unwrap();
+    let observation = |session_id, project_id| {
+        Sanitized::new(
+            NewObservation {
+                session_id,
+                workspace_id: workspace,
+                project_id,
+                kind: ObservationKind::SessionStart,
+                extension: None,
+                source_event: None,
+                title: "start".into(),
+                body: "start".into(),
+                importance: 1,
+            },
+            &Sanitizer::builtin(),
+        )
+    };
+    let correlate = |session_id| IngestCorrelation {
+        taskblu_execution_id: Some("paperclip:run-1".into()),
+        paperclip_run_id: Some("run-1".into()),
+        session_id: Some(session_id),
+        event_kind: Some("session-start".into()),
+        source_event: None,
+        capture_owner: Some("hermes-observer-bridge".into()),
+    };
+
+    let first = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: first,
+            workspace_id: workspace,
+            project_id: project,
+            agent_kind: AgentKind::Hermes,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_observation_ingest_correlated(
+            observation(first, project),
+            "start-1".into(),
+            Some(correlate(first)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .reader
+            .execution_session_for_project("paperclip:run-1", project)
+            .await
+            .unwrap(),
+        Some((first, AgentKind::Hermes))
+    );
+    assert_eq!(
+        store
+            .reader
+            .execution_session_for_project("paperclip:run-1", other_project)
+            .await
+            .unwrap(),
+        None
+    );
+
+    let second = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: second,
+            workspace_id: workspace,
+            project_id: project,
+            agent_kind: AgentKind::Hermes,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_observation_ingest_correlated(
+            observation(second, project),
+            "start-2".into(),
+            Some(correlate(second)),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .reader
+            .execution_session_for_project("paperclip:run-1", project)
+            .await
+            .is_err(),
+        "an execution with two native sessions must not guess the handoff consumer"
+    );
+}

@@ -294,6 +294,10 @@ should be proposed from a completed session, or at explicit wrap-up \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
   pages (idempotent, supports dry-run).\n\
+- `memory_project_membership_set` — only for an authenticated administrator \
+  explicitly granting, changing, suspending, or restoring a registered user's \
+  role in an existing project. This is authorization state, not project \
+  discovery; never infer or broaden membership from a correlation identifier.\n\
 - `memory_install_self_routing` — when the user asks to 'install \
   ai-memory routing into this project' or 'add ai-memory to \
   CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
@@ -1341,6 +1345,43 @@ impl AiMemoryServer {
             .or_else(|| header_session("x-memory-actor-session-id"))
             .or_else(|| header_session("mcp-session-id"));
         ai_memory_core::ActorKey { user, session_id }
+    }
+
+    /// Read the launcher-provided execution correlation without treating it
+    /// as authority. The value is used only to select a native session that
+    /// the hook ingress already persisted in the resolved project.
+    fn taskblu_execution_id_from_parts(
+        parts: &axum::http::request::Parts,
+    ) -> Result<Option<String>, McpError> {
+        let Some(value) = parts
+            .headers
+            .get("x-taskblu-execution-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        // Hermes leaves unresolved ${VAR} references literal outside a
+        // Paperclip launch. Preserve the ordinary MCP behavior in that lane.
+        if value.starts_with("${") && value.ends_with('}') {
+            return Ok(None);
+        }
+        let mut bytes = value.bytes();
+        let valid = value.len() <= 160
+            && bytes
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && bytes.all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            });
+        if !valid {
+            return Err(McpError::invalid_params(
+                "invalid X-Taskblu-Execution-Id header",
+                None,
+            ));
+        }
+        Ok(Some(value.to_owned()))
     }
 
     /// Resolve which `(workspace_id, project_id)` a read tool should
@@ -3368,6 +3409,24 @@ impl AiMemoryServer {
                 None => ai_memory_core::OwnerFilter::Unattributed,
             }
         };
+        let (accepting_session, accepting_agent) =
+            match Self::taskblu_execution_id_from_parts(&parts)? {
+                Some(execution_id) => {
+                    let (session, agent) = self
+                        .reader
+                        .execution_session_for_project(&execution_id, proj)
+                        .await
+                        .map_err(|e| McpError::invalid_params(e.to_string(), None))?
+                        .ok_or_else(|| {
+                            McpError::invalid_params(
+                                "execution header has no correlated native session in this project",
+                                None,
+                            )
+                        })?;
+                    (Some(session), agent)
+                }
+                None => (None, AgentKind::Other),
+            };
         let receiving_cwd = args.cwd;
         let handoff = self
             .reader
@@ -3402,8 +3461,8 @@ impl AiMemoryServer {
                         handoff_id: h.id,
                         workspace_id: ws,
                         project_id: proj,
-                        accepting_agent: AgentKind::Other,
-                        accepting_session: None,
+                        accepting_agent,
+                        accepting_session,
                         accepting_user: actor_user.clone(),
                         owner_filter,
                         receiving_cwd,
@@ -4207,7 +4266,7 @@ fn test_optional_parts() -> OptionalParts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{Sanitized, Sanitizer};
+    use ai_memory_core::{NewHandoff, Sanitized, Sanitizer};
     use std::collections::BTreeSet;
 
     #[test]
@@ -4239,6 +4298,34 @@ mod tests {
         assert!(parts.extensions.get::<AuthLevel>().is_none());
         assert!(parts.extensions.get::<ai_memory_core::UserId>().is_none());
         assert!(parts.extensions.get::<ActorContext>().is_none());
+    }
+
+    #[test]
+    fn taskblu_execution_header_is_validated_and_unresolved_env_is_absent() {
+        let mut parts = test_parts_default();
+        assert_eq!(
+            AiMemoryServer::taskblu_execution_id_from_parts(&parts).unwrap(),
+            None
+        );
+        parts.headers.insert(
+            "x-taskblu-execution-id",
+            "${TASKBLU_EXECUTION_ID}".parse().unwrap(),
+        );
+        assert_eq!(
+            AiMemoryServer::taskblu_execution_id_from_parts(&parts).unwrap(),
+            None
+        );
+        parts
+            .headers
+            .insert("x-taskblu-execution-id", "paperclip:run-1".parse().unwrap());
+        assert_eq!(
+            AiMemoryServer::taskblu_execution_id_from_parts(&parts).unwrap(),
+            Some("paperclip:run-1".into())
+        );
+        parts
+            .headers
+            .insert("x-taskblu-execution-id", "invalid value".parse().unwrap());
+        assert!(AiMemoryServer::taskblu_execution_id_from_parts(&parts).is_err());
     }
 
     #[test]
@@ -4290,7 +4377,7 @@ mod tests {
         ActorContext, AuthLevel, NewObservation, NewPage, NewSession, NewUser, ObservationKind,
         PagePath, Tier,
     };
-    use ai_memory_store::Store;
+    use ai_memory_store::{IngestCorrelation, Store};
     use ai_memory_wiki::{Wiki, WritePageRequest};
     use tempfile::TempDir;
 
@@ -4744,6 +4831,7 @@ mod tests {
         "memory_feedback",
         "memory_lint",
         "memory_forget_sweep",
+        "memory_project_membership_set",
         "memory_install_self_routing",
     ];
 
@@ -8789,6 +8877,111 @@ mod tests {
             .map(|t| t.text.clone())
             .unwrap();
         assert!(again_text.contains("\"handoff\": null"));
+    }
+
+    #[tokio::test]
+    async fn hermes_handoff_accept_records_the_session_from_execution_header() {
+        let (_tmp, store, server, workspace, project) = setup_server().await;
+        let source = SessionId::new();
+        let receiver = SessionId::new();
+        for session in [source, receiver] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: session,
+                    workspace_id: workspace,
+                    project_id: project,
+                    agent_kind: AgentKind::Hermes,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+        }
+        let start = |session_id| {
+            Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: workspace,
+                    project_id: project,
+                    kind: ObservationKind::SessionStart,
+                    extension: None,
+                    source_event: None,
+                    title: "start".into(),
+                    body: "start".into(),
+                    importance: 1,
+                },
+                &Sanitizer::builtin(),
+            )
+        };
+        for (session, execution, key) in [
+            (source, "paperclip:source", "source-start"),
+            (receiver, "paperclip:receiver", "receiver-start"),
+        ] {
+            store
+                .writer
+                .insert_observation_ingest_correlated(
+                    start(session),
+                    key.into(),
+                    Some(IngestCorrelation {
+                        taskblu_execution_id: Some(execution.into()),
+                        paperclip_run_id: Some(execution.trim_start_matches("paperclip:").into()),
+                        session_id: Some(session),
+                        event_kind: Some("session-start".into()),
+                        source_event: None,
+                        capture_owner: Some("hermes-observer-bridge".into()),
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: workspace,
+                project_id: project,
+                from_session_id: Some(source),
+                from_agent: AgentKind::Hermes,
+                to_agent: None,
+                cwd: None,
+                summary: "resume safely".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+
+        let mut parts = test_parts_default();
+        parts.headers.insert(
+            "x-taskblu-execution-id",
+            "paperclip:receiver".parse().unwrap(),
+        );
+        server
+            .memory_handoff_accept(
+                Parameters(HandoffAcceptArgs {
+                    cwd: None,
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                }),
+                OptionalParts(parts),
+            )
+            .await
+            .unwrap();
+
+        let source_evidence = store
+            .reader
+            .execution_evidence("paperclip:source")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source_evidence.handoffs_accepted, 1);
+        assert_eq!(
+            source_evidence.handoff_accepting_session_ids,
+            vec![receiver.to_string()]
+        );
     }
 
     #[tokio::test]
