@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+pub mod access;
 mod auto_improve;
 pub mod decay;
 mod error;
@@ -28,6 +29,9 @@ mod writer;
 
 pub use fts_query::prepare_fts5_query;
 
+pub use access::{
+    AccessAction, AccessDecision, AccessPrincipal, ProjectMembership, ProjectRole, ScopeAuthorizer,
+};
 pub use auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
     AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,

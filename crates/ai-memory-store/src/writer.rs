@@ -18,6 +18,7 @@ use ai_memory_core::{
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::access::ProjectRole;
 use crate::auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, FailAutoImproveProposal,
     RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun,
@@ -315,6 +316,14 @@ pub(crate) enum WriteCmd {
     ReviveUserToken {
         user_id: UserId,
         reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    UpsertProjectMembership {
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        role: ProjectRole,
+        active: bool,
+        reply: oneshot::Sender<StoreResult<()>>,
     },
     TouchUserLastSeen {
         user_id: UserId,
@@ -1345,6 +1354,28 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Create, update, or suspend a user's membership in a project.
+    pub async fn upsert_project_membership(
+        &self,
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        role: ProjectRole,
+        active: bool,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::UpsertProjectMembership {
+            user_id,
+            workspace_id,
+            project_id,
+            role,
+            active,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Update `last_seen_at = now()` for the user. Called fire-and-forget
     /// by the auth middleware on every authenticated request. Returns
     /// `false` when the user doesn't exist (caller authenticated against
@@ -2008,6 +2039,24 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::ReviveUserToken { user_id, reply } => {
                 let result = users::revive_user_token(&conn, user_id);
                 send_or_warn(reply, result, "revive_user_token");
+            }
+            WriteCmd::UpsertProjectMembership {
+                user_id,
+                workspace_id,
+                project_id,
+                role,
+                active,
+                reply,
+            } => {
+                let result = crate::access::upsert_membership(
+                    &conn,
+                    user_id,
+                    workspace_id,
+                    project_id,
+                    role,
+                    active,
+                );
+                send_or_warn(reply, result, "upsert_project_membership");
             }
             WriteCmd::TouchUserLastSeen { user_id, reply } => {
                 let result = users::touch_user_last_seen(&conn, user_id);

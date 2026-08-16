@@ -5981,6 +5981,56 @@ impl ReaderPool {
             .await
     }
 
+    /// Return the current project membership for one authenticated user.
+    pub async fn project_membership(
+        &self,
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Option<crate::access::ProjectMembership>> {
+        self.with_conn(move |conn| {
+            crate::access::find_membership(conn, user_id, workspace_id, project_id)
+        })
+        .await
+    }
+
+    /// Return the active project scopes visible to one user. This allowlist is
+    /// applied before retrieval so global searches cannot leak denied hits.
+    pub async fn active_project_scopes(
+        &self,
+        user_id: UserId,
+    ) -> StoreResult<Vec<(WorkspaceId, ProjectId)>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT workspace_id, project_id FROM project_memberships \
+                 WHERE user_id = ?1 AND active = 1 \
+                 ORDER BY workspace_id, project_id",
+            )?;
+            let rows = stmt.query_map([user_id.as_bytes()], |row| {
+                let workspace =
+                    WorkspaceId::from_slice(&row.get::<_, Vec<u8>>(0)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })?;
+                let project =
+                    ProjectId::from_slice(&row.get::<_, Vec<u8>>(1)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })?;
+                Ok((workspace, project))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
     /// Look up a user by id. **Returns even users whose token is expired**
     /// — this is the attribution-display path (a page authored by alice
     /// must still render "alice" after her token has been expired).
