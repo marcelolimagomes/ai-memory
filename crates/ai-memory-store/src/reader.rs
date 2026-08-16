@@ -1015,6 +1015,54 @@ pub struct HealthDetail {
     pub orphans: Vec<HealthPage>,
 }
 
+/// Count of durable hook receipts for one metadata-only event category.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExecutionEventCount {
+    /// Closed observation-kind label.
+    pub event_kind: String,
+    /// Extension event name, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_event: Option<String>,
+    /// Number of committed receipts in this category.
+    pub count: u64,
+}
+
+/// Aggregated evidence that a cross-component execution reached ai-memory.
+/// Observation bodies, prompts, tool arguments and credentials are excluded.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExecutionEvidence {
+    /// Canonical requested execution identifier.
+    pub taskblu_execution_id: String,
+    /// Distinct Paperclip run identifiers observed.
+    pub paperclip_run_ids: Vec<String>,
+    /// Distinct workspace names touched.
+    pub workspaces: Vec<String>,
+    /// Distinct project names touched.
+    pub projects: Vec<String>,
+    /// Distinct native agent sessions observed.
+    pub session_ids: Vec<String>,
+    /// Distinct components that declared capture ownership.
+    pub capture_owners: Vec<String>,
+    /// Durable receipt counts grouped by event category.
+    pub events: Vec<ExecutionEventCount>,
+    /// Total durable keyed receipts.
+    pub receipts: u64,
+    /// Receipts whose downstream hook side effects completed.
+    pub completed_receipts: u64,
+    /// Receipts still awaiting downstream completion.
+    pub pending_receipts: u64,
+    /// Number of deduplicated delivery attempts.
+    pub replay_count: u64,
+    /// Correlated sessions with a durable end timestamp.
+    pub finalized_sessions: u64,
+    /// Handoffs created by correlated sessions.
+    pub handoffs_created: u64,
+    /// Earliest receipt timestamp in Unix microseconds.
+    pub first_seen_at: i64,
+    /// Latest receipt timestamp in Unix microseconds.
+    pub last_seen_at: i64,
+}
+
 /// Cheap, cloneable read-only connection pool handle.
 #[derive(Clone)]
 pub struct ReaderPool {
@@ -1028,6 +1076,120 @@ struct Inner {
 }
 
 impl ReaderPool {
+    /// Return metadata-only durable evidence for one TaskBlu execution.
+    pub async fn execution_evidence(
+        &self,
+        execution_id: &str,
+    ) -> StoreResult<Option<ExecutionEvidence>> {
+        let execution_id = execution_id.to_owned();
+        self.with_conn(move |conn| {
+            let summary = conn.query_row(
+                "SELECT COUNT(*), COUNT(completed_at), \
+                     COALESCE(SUM(replay_count), 0), MIN(seen_at), MAX(seen_at) \
+                     FROM ingest_keys WHERE taskblu_execution_id = ?1",
+                [&execution_id],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )?;
+            let (receipts, completed_receipts, replay_count, first_seen, last_seen) = summary;
+            let (Some(first_seen_at), Some(last_seen_at)) = (first_seen, last_seen) else {
+                return Ok(None);
+            };
+
+            let collect_strings = |sql: &str| -> StoreResult<Vec<String>> {
+                let mut stmt = conn.prepare(sql)?;
+                let rows = stmt.query_map([&execution_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+            };
+            let paperclip_run_ids = collect_strings(
+                "SELECT DISTINCT paperclip_run_id FROM ingest_keys \
+                 WHERE taskblu_execution_id = ?1 AND paperclip_run_id IS NOT NULL \
+                 ORDER BY paperclip_run_id",
+            )?;
+            let workspaces = collect_strings(
+                "SELECT DISTINCT w.name FROM ingest_keys i \
+                 JOIN projects p ON p.id = i.project_id \
+                 JOIN workspaces w ON w.id = p.workspace_id \
+                 WHERE i.taskblu_execution_id = ?1 ORDER BY w.name",
+            )?;
+            let projects = collect_strings(
+                "SELECT DISTINCT p.name FROM ingest_keys i JOIN projects p ON p.id = i.project_id \
+                 WHERE i.taskblu_execution_id = ?1 ORDER BY p.name",
+            )?;
+            let capture_owners = collect_strings(
+                "SELECT DISTINCT capture_owner FROM ingest_keys \
+                 WHERE taskblu_execution_id = ?1 AND capture_owner IS NOT NULL \
+                 ORDER BY capture_owner",
+            )?;
+
+            let mut session_stmt = conn.prepare(
+                "SELECT DISTINCT session_id FROM ingest_keys \
+                 WHERE taskblu_execution_id = ?1 AND session_id IS NOT NULL ORDER BY session_id",
+            )?;
+            let session_blobs = session_stmt
+                .query_map([&execution_id], |row| row.get::<_, Vec<u8>>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let session_ids = session_blobs
+                .iter()
+                .map(|bytes| SessionId::from_slice(bytes).map(|id| id.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut event_stmt = conn.prepare(
+                "SELECT COALESCE(event_kind, 'unknown'), source_event, COUNT(*) \
+                 FROM ingest_keys WHERE taskblu_execution_id = ?1 \
+                 GROUP BY event_kind, source_event ORDER BY event_kind, source_event",
+            )?;
+            let events = event_stmt
+                .query_map([&execution_id], |row| {
+                    Ok(ExecutionEventCount {
+                        event_kind: row.get(0)?,
+                        source_event: row.get(1)?,
+                        count: row.get(2)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let finalized_sessions = conn.query_row(
+                "SELECT COUNT(DISTINCT s.id) FROM sessions s JOIN ingest_keys i ON i.session_id = s.id \
+                 WHERE i.taskblu_execution_id = ?1 AND s.ended_at IS NOT NULL",
+                [&execution_id],
+                |row| row.get::<_, u64>(0),
+            )?;
+            let handoffs_created = conn.query_row(
+                "SELECT COUNT(DISTINCT h.id) FROM handoffs h JOIN ingest_keys i ON i.session_id = h.from_session_id \
+                 WHERE i.taskblu_execution_id = ?1",
+                [&execution_id],
+                |row| row.get::<_, u64>(0),
+            )?;
+
+            Ok(Some(ExecutionEvidence {
+                taskblu_execution_id: execution_id,
+                paperclip_run_ids,
+                workspaces,
+                projects,
+                session_ids,
+                capture_owners,
+                events,
+                receipts,
+                completed_receipts,
+                pending_receipts: receipts.saturating_sub(completed_receipts),
+                replay_count,
+                finalized_sessions,
+                handoffs_created,
+                first_seen_at,
+                last_seen_at,
+            }))
+        })
+        .await
+    }
+
     /// Initialise the pool. Connections are opened lazily on first use.
     ///
     /// # Errors

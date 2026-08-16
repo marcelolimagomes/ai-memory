@@ -35,6 +35,25 @@ pub enum IngestObservationOutcome {
     AlreadyComplete,
 }
 
+/// Metadata-only correlation committed with a keyed hook observation.
+/// Captured bodies remain in the observation path and are deliberately absent
+/// from execution evidence.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IngestCorrelation {
+    /// Canonical TaskBlu execution identifier.
+    pub taskblu_execution_id: Option<String>,
+    /// Paperclip scheduler run, when present.
+    pub paperclip_run_id: Option<String>,
+    /// Native agent session represented by the receipt.
+    pub session_id: Option<SessionId>,
+    /// Closed observation-kind label.
+    pub event_kind: Option<String>,
+    /// Extension event name, when applicable.
+    pub source_event: Option<String>,
+    /// Component responsible for capture on this lane.
+    pub capture_owner: Option<String>,
+}
+
 /// Result of conditionally ending a session whose persisted observations are
 /// all lifecycle boundaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1038,6 +1057,7 @@ pub fn insert_observation_keyed(
     conn: &mut Connection,
     obs: &NewObservation,
     ingest_key: &str,
+    correlation: Option<&IngestCorrelation>,
 ) -> StoreResult<IngestObservationOutcome> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
@@ -1048,15 +1068,47 @@ pub fn insert_observation_keyed(
         "DELETE FROM ingest_keys WHERE seen_at < ?1",
         params![now - INGEST_KEY_TTL_MICROS],
     )?;
-    let existing: Option<Option<i64>> = tx
+    let existing: Option<(Option<i64>, Option<String>)> = tx
         .query_row(
-            "SELECT completed_at FROM ingest_keys \
+            "SELECT completed_at, taskblu_execution_id FROM ingest_keys \
              WHERE project_id = ?1 AND key = ?2",
             params![obs.project_id.as_bytes(), ingest_key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    if let Some(completed_at) = existing {
+    if let Some((completed_at, existing_execution_id)) = existing {
+        let incoming_execution_id =
+            correlation.and_then(|value| value.taskblu_execution_id.as_ref());
+        if existing_execution_id
+            .as_ref()
+            .is_some_and(|stored| incoming_execution_id.is_some_and(|incoming| incoming != stored))
+        {
+            return Err(StoreError::InvalidState(
+                "ingest key replay changed taskblu_execution_id".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE ingest_keys SET replay_count = replay_count + 1, \
+             taskblu_execution_id = COALESCE(taskblu_execution_id, ?3), \
+             paperclip_run_id = COALESCE(paperclip_run_id, ?4), \
+             session_id = COALESCE(session_id, ?5), \
+             event_kind = COALESCE(event_kind, ?6), \
+             source_event = COALESCE(source_event, ?7), \
+             capture_owner = COALESCE(capture_owner, ?8) \
+             WHERE project_id = ?1 AND key = ?2",
+            params![
+                obs.project_id.as_bytes(),
+                ingest_key,
+                correlation.and_then(|value| value.taskblu_execution_id.as_deref()),
+                correlation.and_then(|value| value.paperclip_run_id.as_deref()),
+                correlation
+                    .and_then(|value| value.session_id.as_ref())
+                    .map(|id| id.as_bytes()),
+                correlation.and_then(|value| value.event_kind.as_deref()),
+                correlation.and_then(|value| value.source_event.as_deref()),
+                correlation.and_then(|value| value.capture_owner.as_deref()),
+            ],
+        )?;
         tx.commit()?;
         return Ok(if completed_at.is_some() {
             IngestObservationOutcome::AlreadyComplete
@@ -1066,9 +1118,23 @@ pub fn insert_observation_keyed(
     }
 
     tx.execute(
-        "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) \
-         VALUES (?1, ?2, ?3, NULL)",
-        params![obs.project_id.as_bytes(), ingest_key, now],
+        "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, \
+         taskblu_execution_id, paperclip_run_id, session_id, event_kind, \
+         source_event, capture_owner) \
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            obs.project_id.as_bytes(),
+            ingest_key,
+            now,
+            correlation.and_then(|value| value.taskblu_execution_id.as_deref()),
+            correlation.and_then(|value| value.paperclip_run_id.as_deref()),
+            correlation
+                .and_then(|value| value.session_id.as_ref())
+                .map(|id| id.as_bytes()),
+            correlation.and_then(|value| value.event_kind.as_deref()),
+            correlation.and_then(|value| value.source_event.as_deref()),
+            correlation.and_then(|value| value.capture_owner.as_deref()),
+        ],
     )?;
     let id = insert_observation_row(&tx, obs)?;
     tx.commit()?;

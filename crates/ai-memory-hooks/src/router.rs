@@ -20,13 +20,13 @@ use ai_memory_core::{
     WorkstreamEvent, WorkstreamEventKind,
 };
 use ai_memory_store::{
-    AccessAction, AccessDecision, AccessPrincipal, IngestObservationOutcome, ScopeAuthorizer,
-    WriterHandle,
+    AccessAction, AccessDecision, AccessPrincipal, IngestCorrelation, IngestObservationOutcome,
+    ScopeAuthorizer, WriterHandle,
 };
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki};
 use axum::Json;
 use axum::Router;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -578,7 +578,58 @@ pub fn hook_router(state: HookState) -> Router {
         .route("/hook", post(handle_hook_with_identity))
         .route("/hook/batch", post(handle_hook_batch_with_identity))
         .route("/handoff", get(handle_handoff_with_identity))
+        .route(
+            "/admin/evidence/executions/{execution_id}",
+            get(handle_execution_evidence),
+        )
         .with_state(Arc::new(state))
+}
+
+/// Root-only, metadata-only receipt aggregate for operational reconciliation.
+async fn handle_execution_evidence(
+    State(state): State<Arc<HookState>>,
+    level: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    Path(execution_id): Path<String>,
+) -> axum::response::Response {
+    match level.map(|axum::Extension(level)| level) {
+        Some(ai_memory_core::AuthLevel::Root) => {}
+        Some(ai_memory_core::AuthLevel::User) => {
+            return (StatusCode::FORBIDDEN, "execution evidence is root-only").into_response();
+        }
+        None | Some(ai_memory_core::AuthLevel::Anonymous) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "execution evidence requires authentication",
+            )
+                .into_response();
+        }
+    }
+    if !valid_execution_id(&execution_id) {
+        return (StatusCode::BAD_REQUEST, "invalid taskblu_execution_id").into_response();
+    }
+    match state.reader.execution_evidence(&execution_id).await {
+        Ok(Some(evidence)) => (StatusCode::OK, Json(evidence)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "execution evidence not found").into_response(),
+        Err(error) => {
+            warn!(error = %error, "execution evidence lookup failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "execution evidence unavailable",
+            )
+                .into_response()
+        }
+    }
+}
+
+fn valid_execution_id(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    value.len() <= 160
+        && first.is_ascii_alphanumeric()
+        && bytes
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 async fn handle_hook_with_identity(
@@ -2523,9 +2574,17 @@ async fn process_with_user(
         None
     };
     if let Some(key) = ingest_key.as_ref() {
+        let correlation = IngestCorrelation {
+            taskblu_execution_id: env.taskblu_execution_id.clone(),
+            paperclip_run_id: env.paperclip_run_id.clone(),
+            session_id: Some(session_id),
+            event_kind: Some(kind.as_str().to_owned()),
+            source_event: env.source_event.clone(),
+            capture_owner: env.capture_owner.clone(),
+        };
         match state
             .writer
-            .insert_observation_ingest(sanitized, key.clone())
+            .insert_observation_ingest_correlated(sanitized, key.clone(), Some(correlation))
             .await?
         {
             IngestObservationOutcome::Inserted(_) => {}
@@ -3203,6 +3262,69 @@ mod tests {
             .await
             .unwrap();
         session_id
+    }
+
+    #[tokio::test]
+    async fn execution_evidence_endpoint_is_root_only_and_metadata_only() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let execution_id = "exec:transactional.1";
+        for (event, key, secret_body) in [
+            ("session-start", "receipt-1", "PRIVATE_START_CONTENT"),
+            ("user-prompt", "receipt-2", "PRIVATE_PROMPT_CONTENT"),
+        ] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("hermes".into()),
+                    ingest_key: Some(key.into()),
+                    taskblu_execution_id: Some(execution_id.into()),
+                    paperclip_run_id: Some("pc-run-1".into()),
+                    capture_owner: Some("hermes-observer-bridge".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": "evidence-session",
+                    "prompt": secret_body,
+                }),
+            );
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+
+        let denied = handle_execution_evidence(
+            State(state.clone()),
+            Some(axum::Extension(ai_memory_core::AuthLevel::User)),
+            Path(execution_id.into()),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let response = handle_execution_evidence(
+            State(state),
+            Some(axum::Extension(ai_memory_core::AuthLevel::Root)),
+            Path(execution_id.into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!body.contains("PRIVATE_START_CONTENT"));
+        assert!(!body.contains("PRIVATE_PROMPT_CONTENT"));
+        let evidence: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(evidence["taskblu_execution_id"], execution_id);
+        assert_eq!(evidence["receipts"], 2);
+        assert_eq!(evidence["completed_receipts"], 2);
+        assert_eq!(evidence["pending_receipts"], 0);
+        assert_eq!(
+            evidence["paperclip_run_ids"],
+            serde_json::json!(["pc-run-1"])
+        );
+        assert_eq!(
+            evidence["capture_owners"],
+            serde_json::json!(["hermes-observer-bridge"])
+        );
     }
 
     #[tokio::test]

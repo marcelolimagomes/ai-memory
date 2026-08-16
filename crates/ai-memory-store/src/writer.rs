@@ -127,6 +127,7 @@ pub(crate) enum WriteCmd {
     InsertObservationIngest {
         obs: NewObservation,
         ingest_key: String,
+        correlation: Option<crate::ops::IngestCorrelation>,
         reply: oneshot::Sender<StoreResult<IngestObservationOutcome>>,
     },
     CompleteObservationIngest {
@@ -657,11 +658,24 @@ impl WriterHandle {
         obs: Sanitized<NewObservation>,
         ingest_key: String,
     ) -> StoreResult<IngestObservationOutcome> {
+        self.insert_observation_ingest_correlated(obs, ingest_key, None)
+            .await
+    }
+
+    /// Claim a keyed hook event with metadata-only execution correlation.
+    /// The receipt and observation commit in the same SQLite transaction.
+    pub async fn insert_observation_ingest_correlated(
+        &self,
+        obs: Sanitized<NewObservation>,
+        ingest_key: String,
+        correlation: Option<crate::ops::IngestCorrelation>,
+    ) -> StoreResult<IngestObservationOutcome> {
         let obs = obs.into_inner();
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::InsertObservationIngest {
             obs,
             ingest_key,
+            correlation,
             reply: tx,
         })
         .await?;
@@ -1751,9 +1765,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::InsertObservationIngest {
                 obs,
                 ingest_key,
+                correlation,
                 reply,
             } => {
-                let result = ops::insert_observation_keyed(&mut conn, &obs, &ingest_key);
+                let result = ops::insert_observation_keyed(
+                    &mut conn,
+                    &obs,
+                    &ingest_key,
+                    correlation.as_ref(),
+                );
                 send_or_warn(reply, result, "insert_observation_ingest");
             }
             WriteCmd::CompleteObservationIngest {

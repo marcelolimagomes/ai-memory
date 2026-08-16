@@ -70,6 +70,14 @@ pub struct HookQuery {
     /// Invocation-scoped `ai-memory run` lease. Absent for every direct
     /// harness launch, preserving legacy capture and handoff behavior.
     pub managed_run: Option<String>,
+    /// Canonical cross-component execution identifier. This is correlation
+    /// metadata only; it never grants access and must not be confused with an
+    /// internal `ai-memory run` lease.
+    pub taskblu_execution_id: Option<String>,
+    /// Optional Paperclip run correlated with the TaskBlu execution.
+    pub paperclip_run_id: Option<String>,
+    /// Component that owns capture for this lane.
+    pub capture_owner: Option<String>,
     /// Client-side opt-in for assistant/Stop capture, baked onto the native
     /// `stop` hook command by `install-hooks --capture-assistant`. A truthy
     /// value tells the server the client deliberately attached a sanitized
@@ -120,6 +128,12 @@ pub struct HookEnvelope {
     pub recall_default_global_requested: bool,
     /// Invocation-scoped managed-run id forwarded by the host hook.
     pub managed_run: Option<String>,
+    /// Validated cross-component correlation identifier.
+    pub taskblu_execution_id: Option<String>,
+    /// Validated Paperclip run identifier.
+    pub paperclip_run_id: Option<String>,
+    /// Validated owner of capture for this execution lane.
+    pub capture_owner: Option<String>,
     /// Optional third-party extension namespace.
     pub extension: Option<String>,
     /// Optional source event name from the extension vocabulary.
@@ -159,6 +173,9 @@ impl std::fmt::Debug for HookEnvelope {
                 &self.recall_default_global_requested,
             )
             .field("managed_run", &self.managed_run)
+            .field("taskblu_execution_id", &self.taskblu_execution_id)
+            .field("paperclip_run_id", &self.paperclip_run_id)
+            .field("capture_owner", &self.capture_owner)
             .field(
                 "capture_assistant_requested",
                 &self.capture_assistant_requested,
@@ -396,6 +413,15 @@ impl HookEnvelope {
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let managed_run = query.managed_run.filter(|value| !value.trim().is_empty());
+        let taskblu_execution_id = query
+            .taskblu_execution_id
+            .filter(|value| valid_correlation_id(value, 160));
+        let paperclip_run_id = query
+            .paperclip_run_id
+            .filter(|value| valid_correlation_id(value, 160));
+        let capture_owner = query
+            .capture_owner
+            .filter(|value| valid_correlation_id(value, 64));
         let capture_assistant_requested = query_flag_truthy(query.capture_assistant.as_deref());
         let extension = normalize_extension_name(query.extension.as_deref());
         let source_event = extension.as_ref().and_then(|_| {
@@ -455,6 +481,9 @@ impl HookEnvelope {
             drop_subagent_requested,
             recall_default_global_requested,
             managed_run,
+            taskblu_execution_id,
+            paperclip_run_id,
+            capture_owner,
             capture_assistant_requested,
             ingest_key,
             extension,
@@ -476,6 +505,19 @@ fn valid_ingest_key(key: &str) -> bool {
         && key
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Correlation fields are identifiers, not arbitrary labels. Restrict them to
+/// a log- and URL-safe alphabet before they reach durable evidence rows.
+fn valid_correlation_id(value: &str, max_len: usize) -> bool {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    value.len() <= max_len
+        && first.is_ascii_alphanumeric()
+        && bytes
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn legacy_tool_title(
@@ -1015,6 +1057,42 @@ mod tests {
             );
         }
         assert_eq!(fire(None).ingest_key, None);
+    }
+
+    #[test]
+    fn execution_correlation_is_validated_and_separate_from_managed_runs() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                taskblu_execution_id: Some("exec:2026-08-15.01".into()),
+                paperclip_run_id: Some("paperclip-run_42".into()),
+                capture_owner: Some("hermes-observer-bridge".into()),
+                managed_run: Some("internal-ai-memory-run".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "correlation-1" }),
+        );
+        assert_eq!(
+            env.taskblu_execution_id.as_deref(),
+            Some("exec:2026-08-15.01")
+        );
+        assert_eq!(env.paperclip_run_id.as_deref(), Some("paperclip-run_42"));
+        assert_eq!(env.capture_owner.as_deref(), Some("hermes-observer-bridge"));
+        assert_eq!(env.managed_run.as_deref(), Some("internal-ai-memory-run"));
+
+        let rejected = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                taskblu_execution_id: Some("contains spaces".into()),
+                paperclip_run_id: Some("../escape".into()),
+                capture_owner: Some("owner?".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "correlation-2" }),
+        );
+        assert!(rejected.taskblu_execution_id.is_none());
+        assert!(rejected.paperclip_run_id.is_none());
+        assert!(rejected.capture_owner.is_none());
     }
 
     #[test]
