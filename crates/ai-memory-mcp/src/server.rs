@@ -25,6 +25,8 @@ use ai_memory_store::{
     ProjectRole, StageAutoImproveRun,
 };
 use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
+
+use crate::tool_surface::ToolSurface;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -442,6 +444,15 @@ pub struct AiMemoryServer {
     /// Whether active project memberships are enforced at MCP read/write
     /// seams. Disabled preserves local/stdio compatibility.
     project_acl_enabled: bool,
+    /// Whether an identity's capability scopes restrict the tool surface it
+    /// may list and invoke.
+    ///
+    /// Orthogonal to [`Self::project_acl_enabled`]: that gate answers "which
+    /// projects", this one answers "which class of operation". Both disabled
+    /// is the historical single-tenant server. Enabling this one alone still
+    /// changes nothing until an operator grants an identity its first scope —
+    /// an identity with no scope rows stays unrestricted.
+    lane_scopes_enabled: bool,
     // Read by the `#[tool_handler]` macro expansion; rustc's dead-code
     // analysis can't see that, so the lint must be allowed explicitly.
     #[allow(dead_code)]
@@ -1229,6 +1240,7 @@ impl AiMemoryServer {
             trusted_proxy_identity: false,
             per_user_slots: false,
             project_acl_enabled: false,
+            lane_scopes_enabled: false,
             tool_router: Self::tool_router(),
         }
     }
@@ -1256,6 +1268,13 @@ impl AiMemoryServer {
     #[must_use]
     pub fn with_project_acl(mut self, enabled: bool) -> Self {
         self.project_acl_enabled = enabled;
+        self
+    }
+
+    /// Enable capability-scope enforcement of the tool surface.
+    #[must_use]
+    pub fn with_lane_scopes(mut self, enabled: bool) -> Self {
+        self.lane_scopes_enabled = enabled;
         self
     }
 
@@ -2385,6 +2404,64 @@ impl AiMemoryServer {
             parts.extensions.get::<ai_memory_core::AuthLevel>().copied(),
             parts.extensions.get::<ai_memory_core::UserId>().copied(),
         )
+    }
+
+    /// Resolve the tool surface for the caller behind `parts`.
+    ///
+    /// Root and local principals keep the full surface: root is the
+    /// break-glass operator credential and stdio callers already own the data
+    /// directory, so restricting either would be theatre. Anonymous callers
+    /// never reach here — the auth middleware rejects them first — but they
+    /// are mapped to the empty-scope case rather than being special-cased, so
+    /// a future transport that forgets to authenticate does not silently
+    /// inherit an unrestricted surface.
+    async fn tool_surface(&self, parts: &axum::http::request::Parts) -> ToolSurface {
+        if !self.lane_scopes_enabled {
+            return ToolSurface::Unrestricted;
+        }
+        let AccessPrincipal::User(user_id) = Self::access_principal(parts) else {
+            return ToolSurface::Unrestricted;
+        };
+        match self.reader.identity_scopes(user_id).await {
+            Ok(scopes) => ToolSurface::from_scopes(scopes),
+            Err(error) => {
+                // Fail closed. A scope lookup that errors must not hand the
+                // caller the unrestricted surface it would have had before the
+                // gate existed; that would turn a transient database fault into
+                // a privilege escalation.
+                tracing::warn!(
+                    error = %error,
+                    "identity scope lookup failed; denying the full tool surface"
+                );
+                ToolSurface::Scoped(std::collections::BTreeSet::new())
+            }
+        }
+    }
+
+    /// Reject a tool call the caller's scopes do not cover.
+    ///
+    /// Deliberately independent of `list_tools`: hiding a tool from the
+    /// listing is a convenience for well-behaved clients, not a control. A
+    /// client that hard-codes a tool name, or one whose runtime offers no
+    /// per-server allowlist at all, still hits this check.
+    async fn require_tool_scope(
+        &self,
+        parts: &axum::http::request::Parts,
+        tool_name: &str,
+    ) -> Result<(), McpError> {
+        if self.tool_surface(parts).await.allows(tool_name) {
+            return Ok(());
+        }
+        // The message names the missing scope but not the caller's granted
+        // set: enough for an operator to fix the grant, not enough for a
+        // probing client to map the credential.
+        Err(McpError::invalid_request(
+            format!(
+                "credential scope does not permit tool '{tool_name}' (requires {})",
+                crate::tool_surface::classify_tool(tool_name).required_scope_str()
+            ),
+            None,
+        ))
     }
 
     async fn require_project_action(
@@ -3870,6 +3947,11 @@ impl ServerHandler for AiMemoryServer {
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, McpError> {
         self.record_client_activity(&request.name, &context);
+        // Scope enforcement runs before dispatch, at the same choke point that
+        // already owns client identity. Putting it here rather than in each
+        // tool means a tool added later cannot forget to check.
+        let parts = OptionalParts::from_extensions(&context.extensions).0;
+        self.require_tool_scope(&parts, &request.name).await?;
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
     }
@@ -3881,7 +3963,16 @@ impl ServerHandler for AiMemoryServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let tools = self.tool_router.list_all();
+        let mut tools = self.tool_router.list_all();
+        // Filter the listing to the caller's capability scopes. This is the
+        // half a client can observe; `call_tool` enforces the same policy
+        // independently, so a client that ignores the listing gains nothing.
+        let surface = self
+            .tool_surface(&OptionalParts::from_extensions(&context.extensions).0)
+            .await;
+        if surface.is_enforcing() {
+            tools.retain(|tool| surface.allows(&tool.name));
+        }
         // rmcp injects `http::request::Parts` into request extensions in
         // both stateless and stateful modes, so the flavor marker is
         // available even without peer clientInfo.
@@ -10340,6 +10431,196 @@ mod tests {
         let locked = buffer.lock().unwrap();
         assert!(locked.pending.is_empty());
         assert!(!locked.flush_scheduled);
+    }
+
+    /// Create a lane identity with the given capability scopes and return
+    /// request parts that authenticate as it.
+    async fn lane_identity(
+        store: &Store,
+        username: &str,
+        scopes: &[ai_memory_core::CapabilityScope],
+    ) -> axum::http::request::Parts {
+        let mut user = ai_memory_core::NewUser {
+            username: username.into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        // The token hash column is UNIQUE, so each identity needs a distinct
+        // one. Derive it from the username rather than using a constant: two
+        // lanes in one test are the whole point, and a constant collides.
+        let mut token_hash = [0u8; 32];
+        for (slot, byte) in token_hash.iter_mut().zip(username.bytes().cycle()) {
+            *slot = byte;
+        }
+        let user_id = store.writer.create_user(user, token_hash).await.unwrap();
+        store
+            .writer
+            .replace_identity_scopes(user_id, scopes.iter().copied().collect())
+            .await
+            .unwrap();
+        let mut parts = test_parts_default();
+        parts.extensions.insert(AuthLevel::User);
+        parts.extensions.insert(user_id);
+        parts
+    }
+
+    /// The Etapa A exit criterion, as an assertion.
+    ///
+    /// The measured defect this closes: the orchestrator lane saw four tools
+    /// and the worker lane saw all of them, with the *same credential against
+    /// the same server*, because the difference was imposed by the client. Two
+    /// credentials differing only in their granted scopes must now produce
+    /// different surfaces server-side.
+    #[tokio::test]
+    async fn lane_scope_decides_the_tool_surface_server_side() {
+        let (_tmp, store, server, _ws, _proj) = setup_server().await;
+        let server = server.with_lane_scopes(true);
+
+        let orchestrator = lane_identity(
+            &store,
+            "lane-orchestrator",
+            &[
+                ai_memory_core::CapabilityScope::MemoryRead,
+                ai_memory_core::CapabilityScope::MemoryHandoffAccept,
+            ],
+        )
+        .await;
+        let worker = lane_identity(
+            &store,
+            "lane-worker",
+            &[ai_memory_core::CapabilityScope::MemoryRead],
+        )
+        .await;
+
+        let orchestrator_surface = server.tool_surface(&orchestrator).await;
+        let worker_surface = server.tool_surface(&worker).await;
+
+        // Both lanes read.
+        assert!(orchestrator_surface.allows("memory_query"));
+        assert!(worker_surface.allows("memory_query"));
+        // Only the orchestrator accepts handoffs — the distinction the old
+        // shared `memory:read` would have erased.
+        assert!(orchestrator_surface.allows("memory_handoff_accept"));
+        assert!(!worker_surface.allows("memory_handoff_accept"));
+        // Neither writes.
+        assert!(!orchestrator_surface.allows("memory_write_page"));
+        assert!(!worker_surface.allows("memory_write_page"));
+    }
+
+    /// Invocation is gated independently of listing.
+    ///
+    /// Hiding a tool from `tools/list` helps a cooperative client and stops
+    /// nothing else. A caller that names the tool directly — which is exactly
+    /// what a runtime without a per-server allowlist does — must still be
+    /// refused.
+    #[tokio::test]
+    async fn a_tool_outside_the_scope_is_refused_even_when_named_directly() {
+        let (_tmp, store, server, _ws, _proj) = setup_server().await;
+        let server = server.with_lane_scopes(true);
+        let worker = lane_identity(
+            &store,
+            "lane-direct-call",
+            &[ai_memory_core::CapabilityScope::MemoryRead],
+        )
+        .await;
+
+        assert!(
+            server
+                .require_tool_scope(&worker, "memory_query")
+                .await
+                .is_ok()
+        );
+
+        let denied = server
+            .require_tool_scope(&worker, "memory_write_page")
+            .await
+            .expect_err("a read-only lane must not reach memory_write_page");
+        // The message names the scope needed, not the scopes held.
+        assert!(denied.message.contains("memory:write"));
+        assert!(!denied.message.contains("memory:read"));
+    }
+
+    /// Mutation proof: the gate can fail, and flipping exactly one input
+    /// flips the verdict.
+    ///
+    /// Three mutations, each isolating one reason the gate might be passing
+    /// for the wrong reason: the flag being off, the scope set being wrong,
+    /// and the identity being root.
+    #[tokio::test]
+    async fn the_scope_gate_can_actually_fail() {
+        let (_tmp, store, server, _ws, _proj) = setup_server().await;
+        let gated = server.clone().with_lane_scopes(true);
+        let reader = lane_identity(
+            &store,
+            "lane-mutation",
+            &[ai_memory_core::CapabilityScope::MemoryRead],
+        )
+        .await;
+
+        // Baseline: denied.
+        assert!(
+            gated
+                .require_tool_scope(&reader, "memory_write_page")
+                .await
+                .is_err()
+        );
+
+        // Mutation 1 — turn the feature off. The same credential and the same
+        // tool must now be allowed, proving the flag is what gates it.
+        let ungated = server.clone().with_lane_scopes(false);
+        assert!(
+            ungated
+                .require_tool_scope(&reader, "memory_write_page")
+                .await
+                .is_ok()
+        );
+
+        // Mutation 2 — widen the credential's scopes. Same flag, same tool.
+        let writer_lane = lane_identity(
+            &store,
+            "lane-mutation-writer",
+            &[
+                ai_memory_core::CapabilityScope::MemoryRead,
+                ai_memory_core::CapabilityScope::MemoryWrite,
+            ],
+        )
+        .await;
+        assert!(
+            gated
+                .require_tool_scope(&writer_lane, "memory_write_page")
+                .await
+                .is_ok()
+        );
+
+        // Mutation 3 — clear every scope. An unscoped identity is unrestricted,
+        // which is what keeps the capability opt-in per credential. If this
+        // ever starts denying, the promotion contract changed.
+        let unscoped = lane_identity(&store, "lane-unscoped", &[]).await;
+        assert!(
+            gated
+                .require_tool_scope(&unscoped, "memory_write_page")
+                .await
+                .is_ok()
+        );
+    }
+
+    /// Root keeps the whole surface: it is the break-glass operator
+    /// credential, and a lane scope must never be readable as a way to
+    /// restrict it.
+    #[tokio::test]
+    async fn root_is_never_restricted_by_lane_scopes() {
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        let server = server.with_lane_scopes(true);
+        let mut root_parts = test_parts_default();
+        root_parts.extensions.insert(AuthLevel::Root);
+        assert!(!server.tool_surface(&root_parts).await.is_enforcing());
+        assert!(
+            server
+                .require_tool_scope(&root_parts, "memory_delete_page")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

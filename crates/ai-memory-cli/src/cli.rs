@@ -355,6 +355,61 @@ pub enum UserCommand {
     /// revives an expired user — rotating a token makes it usable
     /// again. The new plaintext is printed exactly once.
     RotateToken(UserRotateTokenArgs),
+    /// Inspect or replace the capability scopes that decide which MCP
+    /// tools the user's credential may list AND invoke. Enforcement
+    /// additionally requires `lane_scopes_enabled` on the server.
+    Scope(UserScopeArgs),
+}
+
+/// Arguments for `user scope`.
+#[derive(Debug, Args)]
+pub struct UserScopeArgs {
+    /// Scope action to run.
+    #[command(subcommand)]
+    pub command: UserScopeCommand,
+}
+
+/// Subcommands for `user scope`.
+#[derive(Debug, Subcommand)]
+pub enum UserScopeCommand {
+    /// Show the scopes currently granted to a user.
+    Show(UserScopeShowArgs),
+    /// Replace the user's scopes with exactly the ones supplied.
+    /// Replacement rather than addition: this is the only way to demote
+    /// a credential that turned out to reach more than intended.
+    Set(UserScopeSetArgs),
+}
+
+/// Arguments for `user scope show`.
+#[derive(Debug, Args)]
+pub struct UserScopeShowArgs {
+    /// Username to inspect.
+    pub username: String,
+    /// Emit the response as JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `user scope set`.
+#[derive(Debug, Args)]
+pub struct UserScopeSetArgs {
+    /// Username to modify.
+    pub username: String,
+    /// Scopes to grant, comma- or space-separated. Known values:
+    /// `memory:read`, `memory:handoff.accept`, `memory:write`,
+    /// `memory:curate`, `memory:admin`. An unknown scope is rejected
+    /// outright rather than skipped, so a credential can never end up
+    /// narrower than the operator believes.
+    #[arg(long, required_unless_present = "clear")]
+    pub scopes: Option<String>,
+    /// Remove every scope, returning the identity to UNRESTRICTED.
+    /// Spelled as its own flag because `--scopes ""` reads like "no
+    /// access" while it actually means "all access".
+    #[arg(long, conflicts_with = "scopes")]
+    pub clear: bool,
+    /// Emit the response as JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `user add`.

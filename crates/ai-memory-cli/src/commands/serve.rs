@@ -469,7 +469,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_sanitizer(sanitizer.clone())
         .with_trusted_proxy_identity(trusted_proxy_identity_enabled(&config.auth))
         .with_per_user_slots(config.slots.per_user)
-        .with_project_acl(config.project_acl_enabled);
+        .with_project_acl(config.project_acl_enabled)
+        .with_lane_scopes(config.lane_scopes_enabled);
     if let Some(e) = embedder.clone() {
         server = server.with_embedder(e);
     }
@@ -701,6 +702,30 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     store.reader.clone(),
                     store.writer.clone(),
                 );
+            }
+            // Federated rung. Requires the root bearer for the same reason the
+            // proxy rung does: administration must keep a credential that does
+            // not depend on the IdP being reachable.
+            if let Some((issuer, audience, jwks_uri)) = config.auth.federated() {
+                if !auth_state.enabled() {
+                    anyhow::bail!(
+                        "[auth].federated_issuer requires [auth].bearer_token so administration \
+                         keeps a root credential that survives an IdP outage"
+                    );
+                }
+                let federated =
+                    ai_memory_mcp::FederatedAuth::new(ai_memory_mcp::FederatedAuthConfig {
+                        issuer: issuer.clone(),
+                        audience,
+                        jwks_uri,
+                    })
+                    .context("building the federated auth validator")?;
+                auth_state = auth_state.with_federated(
+                    federated,
+                    store.reader.clone(),
+                    store.writer.clone(),
+                );
+                tracing::info!(issuer = %issuer, "federated authentication enabled");
             }
             let auth_state = Arc::new(auth_state);
             let auth_enabled = auth_state.enabled();
@@ -2538,7 +2563,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-        let router = mount_web_router(
+        // The project-ACL work replaced `mount_web_router` with the
+        // ACL-parameterised variant and updated the `serve` call site, but not
+        // this test — so the `ai-memory-cli` test binary stopped compiling on
+        // the fork branch. Passing `false` keeps the assertion exactly what it
+        // was: web routes sit inside the auth layer, independently of project
+        // authorization.
+        let router = mount_web_router_with_acl(
             axum::Router::new(),
             true,
             store.reader.clone(),
@@ -2550,6 +2581,7 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
             },
+            false,
         )
         .unwrap();
         let router = apply_http_layers(

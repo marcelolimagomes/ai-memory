@@ -53,6 +53,22 @@ token_pepper = \"{pepper}\"
 # actor_proxy_bearer_token = \"<distinct-random-token>\"
 # root_issuer  = \"https://idp.example\"
 # root_subject = \"<stable-root-subject>\"
+#
+# Federated (OIDC) authentication for workload credentials. All THREE are
+# required — a partially configured issuer leaves the rung off rather than
+# half-enabling it, because an issuer without a pinned audience would accept a
+# token minted for a different service.
+#
+# Bind each subject to a local user with
+# `PUT /admin/users/<username>/federated-identity`; capability still comes from
+# that user's scopes, so a validated token with no scopes reaches nothing.
+# Only RS256/ES256 are verified; HS256 is refused because with JWKS the
+# verification key is public and a symmetric algorithm would let anyone holding
+# it mint tokens.
+#
+# federated_issuer    = \"https://auth.example/realms/taskblu\"
+# federated_audience  = \"ai-memory\"
+# federated_jwks_uri  = \"https://auth.example/realms/taskblu/protocol/openid-connect/certs\"
 "
     )
 }

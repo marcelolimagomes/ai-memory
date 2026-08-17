@@ -11,10 +11,14 @@
 pub mod actor;
 pub mod admin;
 pub mod auth;
+pub mod federated;
 mod server;
+pub mod tool_surface;
 
 pub use actor::actor_from_headers;
 pub use admin::{
     AdminState, ScopeInvalidation, ScopeInvalidator, admin_router, admin_router_with_decay_breadth,
 };
+pub use federated::{FederatedAuth, FederatedAuthConfig, FederatedClaims, FederatedError};
 pub use server::{AiMemoryServer, MEMORY_INSTRUCTIONS};
+pub use tool_surface::{ToolClass, ToolSurface, classify_tool};

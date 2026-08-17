@@ -6343,6 +6343,80 @@ impl ReaderPool {
             .await
     }
 
+    /// Return the capability scopes granted to one identity.
+    ///
+    /// An empty set means the identity is unscoped. That is deliberately
+    /// distinct from "granted nothing": the caller decides what unscoped means,
+    /// and the server reads it as the historical unrestricted surface so the
+    /// gate stays opt-in per credential.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error, including an unparseable stored scope.
+    pub async fn identity_scopes(
+        &self,
+        user_id: UserId,
+    ) -> StoreResult<std::collections::BTreeSet<ai_memory_core::CapabilityScope>> {
+        self.with_conn(move |conn| crate::capabilities::find_scopes(conn, user_id))
+            .await
+    }
+
+    /// Resolve an OIDC `(issuer, subject)` pair to its local identity.
+    ///
+    /// `None` means the subject authenticated at the IdP but was never bound
+    /// here. That is a refusal, not an invitation to auto-provision: a server
+    /// that created identities on first sight would let anyone the IdP admits
+    /// become a local actor.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn federated_identity(
+        &self,
+        issuer: String,
+        subject: String,
+    ) -> StoreResult<Option<crate::federation::FederatedIdentity>> {
+        self.with_conn(move |conn| crate::federation::find_identity(conn, &issuer, &subject))
+            .await
+    }
+
+    /// Whether a federated token is revoked, by `jti` or by subject.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error. Callers must treat an error as
+    /// revoked: a denylist that cannot be read is not an empty denylist.
+    pub async fn is_token_revoked(
+        &self,
+        issuer: String,
+        jti: Option<String>,
+        subject: String,
+        now_micros: i64,
+    ) -> StoreResult<bool> {
+        self.with_conn(move |conn| {
+            crate::federation::is_revoked(conn, &issuer, jti.as_deref(), &subject, now_micros)
+        })
+        .await
+    }
+
+    /// Resolve an execution claim against the registry.
+    ///
+    /// Returns the bound authorization context, or the reason it was refused.
+    /// Callers must collapse every rejection reason into one client-facing
+    /// error; see [`crate::executions::ExecutionRejection`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn resolve_execution(
+        &self,
+        taskblu_execution_id: String,
+        user_id: UserId,
+    ) -> StoreResult<Result<crate::executions::Execution, crate::executions::ExecutionRejection>>
+    {
+        let now = jiff::Timestamp::now().as_microsecond();
+        self.with_conn(move |conn| {
+            crate::executions::resolve(conn, &taskblu_execution_id, user_id, now)
+        })
+        .await
+    }
+
     /// Return the current project membership for one authenticated user.
     pub async fn project_membership(
         &self,

@@ -14,8 +14,11 @@ use rusqlite::Connection;
 
 pub mod access;
 mod auto_improve;
+pub mod capabilities;
 pub mod decay;
 mod error;
+pub mod executions;
+pub mod federation;
 mod fts_query;
 mod maintenance;
 mod migrations;
@@ -40,11 +43,14 @@ pub use auto_improve::{
     OwnedAutoImproveProposalDetail, RejectAutoImproveProposal, SkippedProposal,
     StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
+pub use capabilities::{find_scopes, grant_scope, replace_scopes, revoke_scope};
 pub use decay::{
     DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
     retention_score_with_breadth, salience_after_feedback,
 };
 pub use error::{StoreError, StoreResult};
+pub use executions::{Execution, ExecutionRejection, NewExecution};
+pub use federation::{FederatedIdentity, RevocationKind};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
     DeleteWorkspaceSummary, EmbeddingWrite, IngestCorrelation, IngestObservationOutcome,

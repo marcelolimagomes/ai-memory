@@ -326,6 +326,35 @@ pub(crate) enum WriteCmd {
         active: bool,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    ReplaceIdentityScopes {
+        user_id: UserId,
+        scopes: std::collections::BTreeSet<ai_memory_core::CapabilityScope>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    UpsertFederatedIdentity {
+        issuer: String,
+        subject: String,
+        user_id: UserId,
+        lane: Option<String>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    RevokeFederatedToken {
+        kind: crate::federation::RevocationKind,
+        issuer: String,
+        value: String,
+        reason: Option<String>,
+        expires_at: i64,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    RegisterExecution {
+        execution: Box<crate::executions::NewExecution>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    CloseExecution {
+        taskblu_execution_id: String,
+        user_id: UserId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     TouchUserLastSeen {
         user_id: UserId,
         reply: oneshot::Sender<StoreResult<bool>>,
@@ -1390,6 +1419,117 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Replace an identity's capability scopes with exactly `scopes`.
+    ///
+    /// Declarative on purpose. A grant-only API can widen a credential but
+    /// never demote one, and demotion is the operation that matters when a
+    /// lane turns out to have more capability than intended.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
+    pub async fn replace_identity_scopes(
+        &self,
+        user_id: UserId,
+        scopes: std::collections::BTreeSet<ai_memory_core::CapabilityScope>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReplaceIdentityScopes {
+            user_id,
+            scopes,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Bind an OIDC `(issuer, subject)` pair to a local identity. Idempotent.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
+    pub async fn upsert_federated_identity(
+        &self,
+        issuer: String,
+        subject: String,
+        user_id: UserId,
+        lane: Option<String>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::UpsertFederatedIdentity {
+            issuer,
+            subject,
+            user_id,
+            lane,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Add a federated token to the revocation denylist.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
+    pub async fn revoke_federated_token(
+        &self,
+        kind: crate::federation::RevocationKind,
+        issuer: String,
+        value: String,
+        reason: Option<String>,
+        expires_at: i64,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RevokeFederatedToken {
+            kind,
+            issuer,
+            value,
+            reason,
+            expires_at,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Register a canonical product execution.
+    ///
+    /// Fails when the id is already registered: a replayed registration must
+    /// collide rather than fork a second execution over the same identifier.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
+    pub async fn register_execution(
+        &self,
+        execution: crate::executions::NewExecution,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RegisterExecution {
+            execution: Box::new(execution),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Close an execution. Idempotent; `false` means it was already closed,
+    /// never registered, or owned by a different identity.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
+    pub async fn close_execution(
+        &self,
+        taskblu_execution_id: String,
+        user_id: UserId,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CloseExecution {
+            taskblu_execution_id,
+            user_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Update `last_seen_at = now()` for the user. Called fire-and-forget
     /// by the auth middleware on every authenticated request. Returns
     /// `false` when the user doesn't exist (caller authenticated against
@@ -2077,6 +2217,60 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     active,
                 );
                 send_or_warn(reply, result, "upsert_project_membership");
+            }
+            WriteCmd::ReplaceIdentityScopes {
+                user_id,
+                scopes,
+                reply,
+            } => {
+                let result = crate::capabilities::replace_scopes(&mut conn, user_id, &scopes);
+                send_or_warn(reply, result, "replace_identity_scopes");
+            }
+            WriteCmd::UpsertFederatedIdentity {
+                issuer,
+                subject,
+                user_id,
+                lane,
+                reply,
+            } => {
+                let result = crate::federation::upsert_identity(
+                    &conn,
+                    &issuer,
+                    &subject,
+                    user_id,
+                    lane.as_deref(),
+                );
+                send_or_warn(reply, result, "upsert_federated_identity");
+            }
+            WriteCmd::RevokeFederatedToken {
+                kind,
+                issuer,
+                value,
+                reason,
+                expires_at,
+                reply,
+            } => {
+                let result = crate::federation::revoke(
+                    &conn,
+                    kind,
+                    &issuer,
+                    &value,
+                    reason.as_deref(),
+                    expires_at,
+                );
+                send_or_warn(reply, result, "revoke_federated_token");
+            }
+            WriteCmd::RegisterExecution { execution, reply } => {
+                let result = crate::executions::register(&conn, &execution);
+                send_or_warn(reply, result, "register_execution");
+            }
+            WriteCmd::CloseExecution {
+                taskblu_execution_id,
+                user_id,
+                reply,
+            } => {
+                let result = crate::executions::close(&conn, &taskblu_execution_id, user_id);
+                send_or_warn(reply, result, "close_execution");
             }
             WriteCmd::TouchUserLastSeen { user_id, reply } => {
                 let result = users::touch_user_last_seen(&conn, user_id);

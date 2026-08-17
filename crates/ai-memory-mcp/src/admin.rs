@@ -52,8 +52,9 @@ use ai_memory_consolidate::{
     run_embedding_backfill, run_lint, run_sweep_with_breadth,
 };
 use ai_memory_core::{
-    ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
-    DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+    ActiveProject, AgentKind, AutoImproveProposalId, Capability, CapabilityScope,
+    DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId, Tier,
+    WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use ai_memory_store::{
@@ -598,6 +599,20 @@ pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -
         .route(
             "/admin/users/{username}/rotate-token",
             post(handle_rotate_user_token),
+        )
+        .route(
+            "/admin/users/{username}/scopes",
+            get(handle_get_user_scopes).put(handle_set_user_scopes),
+        )
+        .route(
+            "/admin/users/{username}/federated-identity",
+            axum::routing::put(handle_bind_federated_identity),
+        )
+        .route("/admin/revocations", post(handle_revoke_token))
+        .route("/admin/executions", post(handle_register_execution))
+        .route(
+            "/admin/executions/{taskblu_execution_id}/close",
+            post(handle_close_execution),
         );
     operational
         .merge(users)
@@ -5294,6 +5309,331 @@ async fn handle_rotate_user_token(
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(UserWithTokenResponse { user, token }).unwrap_or_default()),
+    ))
+}
+
+/// Request body for `PUT /admin/users/:username/scopes`.
+///
+/// A set, not a delta. Replacing is the only operation offered because a
+/// grant-only API can widen a credential but never demote one, and demotion is
+/// precisely the operation that matters when a lane turns out to reach more
+/// than it should.
+#[derive(Debug, Deserialize)]
+struct SetScopesBody {
+    /// Scope names in wire form, e.g. `["memory:read"]`. An empty list
+    /// removes every scope and returns the identity to unrestricted — a
+    /// widening, which the response makes visible via `enforcing`.
+    scopes: Vec<String>,
+}
+
+/// JSON response for the scope routes.
+#[derive(Debug, Serialize)]
+struct ScopesResponse {
+    username: String,
+    scopes: Vec<String>,
+    /// False when the identity has no scopes and therefore reaches every tool.
+    /// Surfaced explicitly so an operator cannot mistake "cleared" for
+    /// "locked down".
+    enforcing: bool,
+}
+
+fn scopes_response(
+    username: String,
+    scopes: &std::collections::BTreeSet<CapabilityScope>,
+) -> ScopesResponse {
+    ScopesResponse {
+        username,
+        scopes: scopes.iter().map(|s| s.as_str().to_string()).collect(),
+        enforcing: !scopes.is_empty(),
+    }
+}
+
+/// Handler for `GET /admin/users/:username/scopes`.
+async fn handle_get_user_scopes(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let user = lookup_user_by_username(&state, &username).await?;
+    let scopes = state
+        .reader
+        .identity_scopes(user.id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(scopes_response(user.username, &scopes)).unwrap_or_default()),
+    ))
+}
+
+/// Handler for `PUT /admin/users/:username/scopes`. Replaces the identity's
+/// capability scopes with exactly the supplied set.
+async fn handle_set_user_scopes(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+    Json(body): Json<SetScopesBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let user = lookup_user_by_username(&state, &username).await?;
+    // Parse the whole set before touching the database. A partially-applied
+    // grant would leave the credential in a state the operator never asked
+    // for, which is worse than rejecting the request.
+    let mut parsed = std::collections::BTreeSet::new();
+    for raw in &body.scopes {
+        let scope = CapabilityScope::parse(raw).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("unknown capability scope: {raw}"),
+                    "known_scopes": CapabilityScope::ALL
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>(),
+                })),
+            )
+        })?;
+        parsed.insert(scope);
+    }
+    state
+        .writer
+        .replace_identity_scopes(user.id, parsed.clone())
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(scopes_response(user.username, &parsed)).unwrap_or_default()),
+    ))
+}
+
+/// Request body for `PUT /admin/users/{username}/federated-identity`.
+#[derive(Debug, Deserialize)]
+struct BindFederatedIdentityBody {
+    /// Exact `iss` the token will carry.
+    issuer: String,
+    /// Exact `sub`. Unique only within its issuer, which is why both are
+    /// required and neither has a default.
+    subject: String,
+    /// Lane label for audit. Never consulted for authorization.
+    #[serde(default)]
+    lane: Option<String>,
+}
+
+/// Handler for `PUT /admin/users/{username}/federated-identity`.
+async fn handle_bind_federated_identity(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+    Json(body): Json<BindFederatedIdentityBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let user = lookup_user_by_username(&state, &username).await?;
+    state
+        .writer
+        .upsert_federated_identity(
+            body.issuer.trim().to_string(),
+            body.subject.trim().to_string(),
+            user.id,
+            body.lane.as_deref().map(str::trim).map(str::to_string),
+        )
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "username": user.username,
+            "issuer": body.issuer.trim(),
+            "subject": body.subject.trim(),
+            "lane": body.lane,
+        })),
+    ))
+}
+
+/// Request body for `POST /admin/revocations`.
+#[derive(Debug, Deserialize)]
+struct RevokeBody {
+    /// `jti` kills one token; `subject` kills every token an identity holds —
+    /// the latter is what an operator needs when the credential itself leaked
+    /// and fresh tokens are still being minted.
+    kind: String,
+    issuer: String,
+    value: String,
+    #[serde(default)]
+    reason: Option<String>,
+    /// How long the denylist row is kept. It must outlive any token the
+    /// revocation is meant to stop; sweeping earlier would silently
+    /// un-revoke a live token.
+    #[serde(default)]
+    ttl_seconds: Option<u32>,
+}
+
+/// Default denylist retention: far longer than the 10-minute lane token, so a
+/// revocation cannot expire before what it targets.
+const DEFAULT_REVOCATION_TTL_SECONDS: u32 = 24 * 60 * 60;
+
+/// Handler for `POST /admin/revocations`.
+async fn handle_revoke_token(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    Json(body): Json<RevokeBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let kind = match body.kind.trim().to_ascii_lowercase().as_str() {
+        "jti" => ai_memory_store::RevocationKind::Jti,
+        "subject" => ai_memory_store::RevocationKind::Subject,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("unknown revocation kind: {other}"),
+                    "known_kinds": ["jti", "subject"],
+                })),
+            ));
+        }
+    };
+    let ttl = body.ttl_seconds.unwrap_or(DEFAULT_REVOCATION_TTL_SECONDS);
+    let expires_at = jiff::Timestamp::now().as_microsecond() + i64::from(ttl) * 1_000_000;
+    state
+        .writer
+        .revoke_federated_token(
+            kind,
+            body.issuer.trim().to_string(),
+            body.value.trim().to_string(),
+            body.reason.as_deref().map(str::trim).map(str::to_string),
+            expires_at,
+        )
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "kind": kind.as_str(),
+            "issuer": body.issuer.trim(),
+            "ttl_seconds": ttl,
+        })),
+    ))
+}
+
+/// Request body for `POST /admin/executions`.
+#[derive(Debug, Deserialize)]
+struct RegisterExecutionBody {
+    /// Canonical execution identifier, minted by the launcher before the lane
+    /// starts. Caller-supplied on purpose: the launcher has to know it first.
+    taskblu_execution_id: String,
+    /// Username of the identity that will act inside this execution.
+    username: String,
+    /// Workspace name the execution is bound to.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Project name the execution is bound to.
+    project: String,
+    /// Effective lane label. Attribution only — capability comes from the
+    /// identity's scopes, never from this string.
+    #[serde(default)]
+    lane: Option<String>,
+    /// Optional Paperclip correlation. Grants nothing on its own.
+    #[serde(default)]
+    paperclip_run_id: Option<String>,
+    /// Lifetime in seconds. Bounded server-side.
+    #[serde(default)]
+    ttl_seconds: Option<u32>,
+}
+
+/// Upper bound on an execution's lifetime, in seconds.
+///
+/// A registration is an authorization context, so it gets a hard ceiling
+/// rather than whatever the caller asks for: a launcher that crashes after
+/// requesting a year-long execution must not leave a year-long context behind.
+const MAX_EXECUTION_TTL_SECONDS: u32 = 12 * 60 * 60;
+/// Default lifetime when the caller does not ask for one.
+const DEFAULT_EXECUTION_TTL_SECONDS: u32 = 60 * 60;
+
+/// Handler for `POST /admin/executions`. Registers a canonical execution.
+async fn handle_register_execution(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    Json(body): Json<RegisterExecutionBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let user = lookup_user_by_username(&state, &body.username).await?;
+    let workspace_name = body
+        .workspace
+        .as_deref()
+        .map_or(DEFAULT_WORKSPACE_NAME, str::trim);
+    // No auto-creation: a typo in the project name must fail the registration
+    // rather than mint an execution bound to a project nobody meant.
+    let (workspace_id, project_id) =
+        lookup_ws_proj_no_create(&state, workspace_name, body.project.trim()).await?;
+    let ttl_seconds = body
+        .ttl_seconds
+        .unwrap_or(DEFAULT_EXECUTION_TTL_SECONDS)
+        .clamp(1, MAX_EXECUTION_TTL_SECONDS);
+    state
+        .writer
+        .register_execution(ai_memory_store::NewExecution {
+            taskblu_execution_id: body.taskblu_execution_id.trim().to_string(),
+            user_id: user.id,
+            workspace_id,
+            project_id,
+            lane: body.lane.as_deref().map(str::trim).map(str::to_string),
+            paperclip_run_id: body
+                .paperclip_run_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            ttl_micros: i64::from(ttl_seconds) * 1_000_000,
+        })
+        .await
+        .map_err(|e| {
+            // A duplicate id is the caller's problem, not a server fault:
+            // replaying a registration must be visible rather than silently
+            // reusing the first one.
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "taskblu_execution_id": body.taskblu_execution_id.trim(),
+            "username": user.username,
+            "ttl_seconds": ttl_seconds,
+        })),
+    ))
+}
+
+/// Request body for `POST /admin/executions/{id}/close`.
+#[derive(Debug, Deserialize)]
+struct CloseExecutionBody {
+    username: String,
+}
+
+/// Handler for `POST /admin/executions/{id}/close`.
+async fn handle_close_execution(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    axum::extract::Path(taskblu_execution_id): axum::extract::Path<String>,
+    Json(body): Json<CloseExecutionBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let user = lookup_user_by_username(&state, &body.username).await?;
+    let closed = state
+        .writer
+        .close_execution(taskblu_execution_id.trim().to_string(), user.id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "taskblu_execution_id": taskblu_execution_id.trim(),
+            // False covers "already closed", "never registered" and "owned by
+            // someone else" alike. Distinguishing them here would turn the
+            // route into an oracle for other lanes' execution ids.
+            "closed": closed,
+        })),
     ))
 }
 
