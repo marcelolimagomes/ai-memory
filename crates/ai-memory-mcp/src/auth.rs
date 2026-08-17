@@ -101,6 +101,26 @@ pub struct AuthState {
     /// separate from the root bearer so a missing identity assertion cannot
     /// accidentally turn proxy traffic into root traffic.
     actor_proxy_bearer: Option<String>,
+    /// Federated (OIDC) validation tier. `None` disables the rung entirely,
+    /// which is the default and the state every existing deployment stays in
+    /// until an operator configures an issuer.
+    federated: Option<FederatedResolver>,
+}
+
+/// Optional federated tier — validate a JWT against a trusted issuer's JWKS
+/// and resolve its `(issuer, subject)` pair to a local identity.
+///
+/// Both halves are required. Validation without the mapping would authenticate
+/// a caller the server cannot attribute or scope; the mapping without
+/// validation would trust a claim nobody verified.
+#[derive(Clone)]
+pub struct FederatedResolver {
+    /// Validates signature, issuer, audience, algorithm and expiry.
+    pub auth: Arc<crate::federated::FederatedAuth>,
+    /// Resolves the identity mapping and checks the revocation denylist.
+    pub reader: ReaderPool,
+    /// Writer for the fire-and-forget `last_seen_at` bump.
+    pub writer: WriterHandle,
 }
 
 impl AuthState {
@@ -157,6 +177,26 @@ impl AuthState {
     pub fn with_trusted_proxy_bearer(mut self, token: impl Into<String>) -> Self {
         let token = token.into();
         self.actor_proxy_bearer = Some(token).filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Enable the federated rung.
+    ///
+    /// Absent by default. Attaching it is what promotes the capability, and
+    /// nothing else changes behaviour: a deployment that never calls this
+    /// keeps exactly the rungs it had.
+    #[must_use]
+    pub fn with_federated(
+        mut self,
+        auth: Arc<crate::federated::FederatedAuth>,
+        reader: ReaderPool,
+        writer: WriterHandle,
+    ) -> Self {
+        self.federated = Some(FederatedResolver {
+            auth,
+            reader,
+            writer,
+        });
         self
     }
 
@@ -363,6 +403,29 @@ pub async fn require_bearer(
         return next.run(req).await;
     }
 
+    // Rung 1c: a Bearer shaped like a JWT, validated against the trusted
+    // issuer's JWKS.
+    //
+    // Placed here on purpose. After rung 1 so a malformed JWT is never
+    // compared against the root credential; before rung 2 so a federated token
+    // does not pay a token-hash lookup that could never match — the hash of a
+    // JWT is not in `users`. Only an explicit Bearer qualifies: Basic and
+    // cookie are browser conveniences and must not carry a workload identity.
+    if let Some(fed) = state.federated.as_ref()
+        && let Some(bearer) = from_bearer.as_deref()
+        && crate::federated::looks_like_jwt(bearer)
+    {
+        return match federated_rung(fed, bearer, req, next).await {
+            Ok(response) => response,
+            Err(()) => {
+                // Every federated failure lands here as one 401. The specific
+                // reason was logged; surfacing it to the caller would turn the
+                // rung into an oracle for issuer, audience and key state.
+                unauthorized(is_get)
+            }
+        };
+    }
+
     // Rung 2: bearer matches neither root nor proxy. If multi-user is enabled,
     // hash + look up the token against the `users` table.
     if let Some(mu) = state.multiuser.as_ref()
@@ -420,6 +483,124 @@ pub async fn require_bearer(
 
     debug!("auth rejected: invalid or missing token");
     unauthorized(is_get)
+}
+
+/// The federated rung's body.
+///
+/// Returns `Err(())` for every refusal so the caller emits one indistinct 401.
+/// The reason is logged, never sent.
+async fn federated_rung(
+    fed: &FederatedResolver,
+    bearer: &str,
+    mut req: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, ()> {
+    let claims = match fed.auth.validate(bearer).await {
+        Ok(claims) => claims,
+        Err(error) => {
+            debug!(?error, "auth rejected: federated token failed validation");
+            return Err(());
+        }
+    };
+
+    // Revocation is checked after signature validation and before identity
+    // resolution. After, because an unverified token's claims name nobody
+    // worth looking up; before, so a revoked token never touches the identity
+    // map or bumps last_seen_at.
+    let now = jiff::Timestamp::now().as_microsecond();
+    match fed
+        .reader
+        .is_token_revoked(
+            claims.iss.clone(),
+            claims.jti.clone(),
+            claims.sub.clone(),
+            now,
+        )
+        .await
+    {
+        Ok(true) => {
+            debug!(
+                actor.issuer = %claims.iss,
+                actor.sub = %claims.sub,
+                "auth rejected: federated token is revoked"
+            );
+            return Err(());
+        }
+        Ok(false) => {}
+        Err(error) => {
+            // Fail closed. A denylist we could not read is not an empty
+            // denylist.
+            tracing::error!(error = %error, "auth: revocation lookup failed");
+            return Err(());
+        }
+    }
+
+    let identity = match fed
+        .reader
+        .federated_identity(claims.iss.clone(), claims.sub.clone())
+        .await
+    {
+        Ok(Some(identity)) => identity,
+        Ok(None) => {
+            debug!(
+                actor.issuer = %claims.iss,
+                actor.sub = %claims.sub,
+                "auth rejected: federated subject is not mapped to a local identity"
+            );
+            return Err(());
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "auth: federated identity lookup failed");
+            return Err(());
+        }
+    };
+
+    let user = match fed.reader.find_user_by_id(identity.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            // The mapping outlived its user row. Fail closed rather than
+            // authenticate an identity with no scopes attached.
+            tracing::warn!(
+                user_id = %identity.user_id,
+                "auth: federated mapping points at a missing user"
+            );
+            return Err(());
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "auth: user lookup failed");
+            return Err(());
+        }
+    };
+
+    debug!(
+        actor.user = %user.username,
+        actor.lane = ?identity.lane,
+        "authenticated as federated identity"
+    );
+    let actor = ActorContext {
+        user: Some(user.username.clone()),
+        name: user.name.clone(),
+        email: user.email.clone(),
+        issuer: Some(claims.iss.clone()),
+        sub: Some(claims.sub.clone()),
+        ..ActorContext::default()
+    };
+    req.extensions_mut().insert(actor);
+    req.extensions_mut().insert(user.id);
+    // Always `User`, never `Root`. A federated token is a workload credential;
+    // root is the break-glass operator bearer and is not reachable by
+    // presenting a JWT, however well signed.
+    req.extensions_mut().insert(AuthLevel::User);
+
+    let writer = fed.writer.clone();
+    let user_id = user.id;
+    tokio::spawn(async move {
+        if let Err(e) = writer.touch_user_last_seen(user_id).await {
+            tracing::warn!(error = %e, user_id = %user_id, "touch_user_last_seen failed");
+        }
+    });
+
+    Ok(next.run(req).await)
 }
 
 fn extract_bearer_header(req: &Request<axum::body::Body>) -> Option<String> {
@@ -1429,6 +1610,147 @@ mod tests {
             })
             .with_multiuser(pepper, store.reader.clone(), store.writer.clone());
         (tmp, state, token)
+    }
+
+    /// A federated state whose issuer is real but whose JWKS is unroutable.
+    ///
+    /// Every federated test here asserts a **refusal**, and a refusal must not
+    /// depend on reaching the network. Pointing the JWKS at a closed port
+    /// makes the fail-closed behaviour the thing under test rather than an
+    /// accident of connectivity.
+    async fn setup_federated(username: &str) -> (TempDir, AuthState, String) {
+        let (tmp, state, token) = setup_multiuser(username).await;
+        let store = Store::open(tmp.path()).unwrap();
+        let federated =
+            crate::federated::FederatedAuth::new(crate::federated::FederatedAuthConfig {
+                issuer: "https://auth.taskblu.com/realms/taskblu".into(),
+                audience: "ai-memory".into(),
+                jwks_uri: "http://127.0.0.1:1/jwks".into(),
+            })
+            .unwrap();
+        let state = state.with_federated(federated, store.reader.clone(), store.writer.clone());
+        (tmp, state, token)
+    }
+
+    /// A syntactically valid RS256 JWT whose signature nobody can verify.
+    /// Header: {"alg":"RS256","typ":"JWT","kid":"k1"}.
+    const FAKE_JWT: &str =
+        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImsxIn0.eyJzdWIiOiJzdmMtd29ya2VyIn0.c2ln";
+
+    async fn probe_with_bearer(state: AuthState, bearer: &str) -> StatusCode {
+        router_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_jwt_shaped_bearer_is_refused_when_its_signature_cannot_be_verified() {
+        let (_tmp, state, _token) = setup_federated("lane-worker").await;
+        assert_eq!(
+            probe_with_bearer(state, FAKE_JWT).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn the_federated_rung_does_not_disturb_the_rungs_around_it() {
+        // The rung sits between 1b and 2, so both neighbours must still work
+        // with it attached. A regression here would be invisible in the
+        // federated tests themselves.
+        let (_tmp, state, user_token) = setup_federated("lane-neighbour").await;
+
+        // Rung 1 — root still authenticates.
+        assert_eq!(
+            probe_with_bearer(state.clone(), "root-token-distinct-from-user-token").await,
+            StatusCode::OK
+        );
+        // Rung 2 — an opaque DB-user token still authenticates. It is not
+        // JWT-shaped, so the federated rung must decline to consume it.
+        assert_eq!(
+            probe_with_bearer(state.clone(), &user_token).await,
+            StatusCode::OK
+        );
+        // And an unknown opaque token is still refused.
+        assert_eq!(
+            probe_with_bearer(state, "not-a-real-token").await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn the_federated_rung_can_actually_fail_and_the_switch_is_the_attachment() {
+        // Mutation: the same JWT-shaped bearer, with and without the rung
+        // attached. Without it, the bearer falls through to rung 2 and is
+        // refused as an unknown opaque token; with it, it is refused by
+        // federated validation. Both refuse — the point is that attaching the
+        // rung never *widens* what is accepted.
+        let (_tmp, federated_state, _t) = setup_federated("lane-mutation").await;
+        let (_tmp2, plain_state, _t2) = setup_multiuser("lane-mutation-plain").await;
+        assert_eq!(
+            probe_with_bearer(federated_state, FAKE_JWT).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            probe_with_bearer(plain_state, FAKE_JWT).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn the_federated_rung_never_shadows_the_root_credential() {
+        // Ordering matters and is easy to break silently. If the federated
+        // rung were placed before rung 1, a root bearer that happens to be
+        // JWT-shaped would stop authenticating — administration would be
+        // locked out by a token format coincidence.
+        //
+        // The setup makes that coincidence real: the root credential IS
+        // JWT-shaped here.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let federated =
+            crate::federated::FederatedAuth::new(crate::federated::FederatedAuthConfig {
+                issuer: "https://auth.taskblu.com/realms/taskblu".into(),
+                audience: "ai-memory".into(),
+                jwks_uri: "http://127.0.0.1:1/jwks".into(),
+            })
+            .unwrap();
+        let state = AuthState::new(Some(FAKE_JWT.to_string()))
+            .with_root_actor(ActorContext {
+                user: Some("root".into()),
+                ..ActorContext::default()
+            })
+            .with_federated(federated, store.reader.clone(), store.writer.clone());
+
+        // Rung 1 wins: the root credential still authenticates, as root.
+        let resp = router_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", format!("Bearer {FAKE_JWT}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_as_actor(resp).await.user.as_deref(), Some("root"));
+
+        // A *different* JWT-shaped bearer is not root, so it falls to the
+        // federated rung and is refused — no JWT reaches root capability by
+        // being well-formed.
+        let other = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImsyIn0.eyJzdWIiOiJ4In0.c2ln";
+        assert_eq!(
+            probe_with_bearer(state, other).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

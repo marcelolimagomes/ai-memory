@@ -163,6 +163,7 @@ impl Harness {
             session_consolidation_notify: None,
             capture_assistant_enabled: false,
             per_user_slots: false,
+            project_acl_enabled: false,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(
                 ai_memory_hooks::IngestRateLimiter::disabled(),

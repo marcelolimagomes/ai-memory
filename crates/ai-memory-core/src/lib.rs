@@ -7,6 +7,7 @@
 
 pub mod active_project;
 pub mod actor;
+pub mod capability;
 pub mod error;
 pub mod handoff;
 pub mod ids;
@@ -43,6 +44,7 @@ pub use actor::{
     SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp, parse_skip_admission_chain,
     skip_admission_chain_for,
 };
+pub use capability::CapabilityScope;
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{Handoff, HandoffAcceptance, HandoffState, NewHandoff};
 pub use ids::{

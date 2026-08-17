@@ -235,6 +235,36 @@ pub async fn get_json<T: DeserializeOwned>(
         .with_context(|| format!("parsing JSON body from GET {url}"))
 }
 
+/// PUT a JSON body to `<endpoint>{path}`, deserialise the JSON response.
+///
+/// PUT rather than POST because the capability-scope route replaces a set
+/// rather than appending to it, and the verb is the first thing an operator
+/// reads when auditing what a command did.
+///
+/// # Errors
+/// Same as [`get_json`].
+pub async fn put_json<B: Serialize, T: DeserializeOwned>(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    body: &B,
+) -> Result<T> {
+    let client = reqwest::Client::new();
+    let url = endpoint.build_url(path);
+    let req = endpoint.authenticate(client.put(&url).json(body));
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| augment_connect_error(e, endpoint, &url))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(server_response_error(status, body));
+    }
+    resp.json::<T>()
+        .await
+        .with_context(|| format!("parsing JSON body from PUT {url}"))
+}
+
 /// POST JSON body to `<endpoint>{path}`, deserialise JSON response.
 ///
 /// # Errors

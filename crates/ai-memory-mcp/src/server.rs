@@ -15,12 +15,18 @@ use ai_memory_core::{
 };
 use ai_memory_llm::{Embedder, LlmProvider};
 use ai_memory_store::{
+    AccessAction, AccessDecision, AccessPrincipal, DecayParams, PageHit, ReaderPool,
+    ScopeAuthorizer, ScopeName, ScopeResolver, WriterHandle, lookup_existing_scope,
+    lookup_global_scope,
+};
+use ai_memory_store::{
     AutoImproveProposalOperation, CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY,
     CLIENT_ACTIVITY_MAX_NAME_CHARS, CLIENT_ACTIVITY_OVERFLOW_CLIENT, NewAutoImproveProposal,
-    StageAutoImproveRun,
+    ProjectRole, StageAutoImproveRun,
 };
-use ai_memory_store::{DecayParams, PageHit, ReaderPool, ScopeName, ScopeResolver, WriterHandle};
 use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
+
+use crate::tool_surface::ToolSurface;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -290,6 +296,10 @@ should be proposed from a completed session, or at explicit wrap-up \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
   pages (idempotent, supports dry-run).\n\
+- `memory_project_membership_set` — only for an authenticated administrator \
+  explicitly granting, changing, suspending, or restoring a registered user's \
+  role in an existing project. This is authorization state, not project \
+  discovery; never infer or broaden membership from a correlation identifier.\n\
 - `memory_install_self_routing` — when the user asks to 'install \
   ai-memory routing into this project' or 'add ai-memory to \
   CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
@@ -431,6 +441,18 @@ pub struct AiMemoryServer {
     /// default, and every deployment that never sets the flag — means a nested
     /// slot path is an ordinary shared page, so both stay exactly as they were.
     per_user_slots: bool,
+    /// Whether active project memberships are enforced at MCP read/write
+    /// seams. Disabled preserves local/stdio compatibility.
+    project_acl_enabled: bool,
+    /// Whether an identity's capability scopes restrict the tool surface it
+    /// may list and invoke.
+    ///
+    /// Orthogonal to [`Self::project_acl_enabled`]: that gate answers "which
+    /// projects", this one answers "which class of operation". Both disabled
+    /// is the historical single-tenant server. Enabling this one alone still
+    /// changes nothing until an operator grants an identity its first scope —
+    /// an identity with no scope rows stays unrestricted.
+    lane_scopes_enabled: bool,
     // Read by the `#[tool_handler]` macro expansion; rustc's dead-code
     // analysis can't see that, so the lint must be allowed explicitly.
     #[allow(dead_code)]
@@ -514,6 +536,25 @@ struct StatusArgs {
     /// current/default workspace resolution chain.
     #[serde(default)]
     workspace: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ProjectMembershipSetArgs {
+    /// Existing registered ai-memory username.
+    username: String,
+    /// Existing workspace name.
+    workspace: String,
+    /// Existing project name inside the workspace.
+    project: String,
+    /// `viewer`, `contributor`, `curator`, or `owner`.
+    role: String,
+    /// False suspends access without deleting provenance.
+    #[serde(default = "default_membership_active")]
+    active: bool,
+}
+
+fn default_membership_active() -> bool {
+    true
 }
 
 /// One `memory_query` hit; serializes exactly like a bare
@@ -1198,6 +1239,8 @@ impl AiMemoryServer {
             access_bump_seen: Arc::new(Mutex::new(HashMap::new())),
             trusted_proxy_identity: false,
             per_user_slots: false,
+            project_acl_enabled: false,
+            lane_scopes_enabled: false,
             tool_router: Self::tool_router(),
         }
     }
@@ -1218,6 +1261,20 @@ impl AiMemoryServer {
     #[must_use]
     pub fn with_per_user_slots(mut self, enabled: bool) -> Self {
         self.per_user_slots = enabled;
+        self
+    }
+
+    /// Enable project-membership authorization for MCP operations.
+    #[must_use]
+    pub fn with_project_acl(mut self, enabled: bool) -> Self {
+        self.project_acl_enabled = enabled;
+        self
+    }
+
+    /// Enable capability-scope enforcement of the tool surface.
+    #[must_use]
+    pub fn with_lane_scopes(mut self, enabled: bool) -> Self {
+        self.lane_scopes_enabled = enabled;
         self
     }
 
@@ -1307,6 +1364,43 @@ impl AiMemoryServer {
             .or_else(|| header_session("x-memory-actor-session-id"))
             .or_else(|| header_session("mcp-session-id"));
         ai_memory_core::ActorKey { user, session_id }
+    }
+
+    /// Read the launcher-provided execution correlation without treating it
+    /// as authority. The value is used only to select a native session that
+    /// the hook ingress already persisted in the resolved project.
+    fn taskblu_execution_id_from_parts(
+        parts: &axum::http::request::Parts,
+    ) -> Result<Option<String>, McpError> {
+        let Some(value) = parts
+            .headers
+            .get("x-taskblu-execution-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        // Hermes leaves unresolved ${VAR} references literal outside a
+        // Paperclip launch. Preserve the ordinary MCP behavior in that lane.
+        if value.starts_with("${") && value.ends_with('}') {
+            return Ok(None);
+        }
+        let mut bytes = value.bytes();
+        let valid = value.len() <= 160
+            && bytes
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && bytes.all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            });
+        if !valid {
+            return Err(McpError::invalid_params(
+                "invalid X-Taskblu-Execution-Id header",
+                None,
+            ));
+        }
+        Ok(Some(value.to_owned()))
     }
 
     /// Resolve which `(workspace_id, project_id)` a read tool should
@@ -1763,15 +1857,28 @@ impl AiMemoryServer {
                     None,
                 ));
             }
-            let global_hits = self
-                .reader
-                .search_pages_with_meta(
-                    args.query.clone(),
-                    limit,
-                    include_expired.then_some(i64::MIN),
-                )
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let global_hits = match self.authorized_global_scopes(&parts).await? {
+                None => {
+                    self.reader
+                        .search_pages_with_meta(
+                            args.query.clone(),
+                            limit,
+                            include_expired.then_some(i64::MIN),
+                        )
+                        .await
+                }
+                Some(scopes) => {
+                    self.reader
+                        .search_pages_with_meta_for_scopes(
+                            args.query.clone(),
+                            limit,
+                            include_expired.then_some(i64::MIN),
+                            scopes,
+                        )
+                        .await
+                }
+            }
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             return ok_json(&MemoryQueryResponse {
                 hits: Vec::new(),
                 raw_hits: Vec::new(),
@@ -1804,6 +1911,12 @@ impl AiMemoryServer {
         } else {
             Some(self.resolve_query_scopes(&args.scopes).await?)
         };
+        if let Some(scopes) = &resolved_scopes {
+            for &(workspace_id, project_id) in scopes {
+                self.require_project_action(&parts, workspace_id, project_id, AccessAction::Read)
+                    .await?;
+            }
+        }
         let hits = if let Some(scopes) = &resolved_scopes {
             let mut hits_by_id: HashMap<PageId, (PageHit, Option<ai_memory_store::SearchExplain>)> =
                 HashMap::new();
@@ -1851,6 +1964,8 @@ impl AiMemoryServer {
                     args.project.as_deref(),
                     &aps_actor,
                 )
+                .await?;
+            self.require_project_action(&parts, ws, proj, AccessAction::Read)
                 .await?;
             self.search_project(
                 ws,
@@ -2009,11 +2124,15 @@ impl AiMemoryServer {
         let explicit_scoping =
             named_scope_args_present(args.workspace.as_deref(), args.project.as_deref());
         if !explicit_scoping && self.active_project.default_global_for(&aps_actor) {
-            let global_hits = self
-                .reader
-                .recent_pages_global(limit)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let global_hits = match self.authorized_global_scopes(&parts).await? {
+                None => self.reader.recent_pages_global(limit).await,
+                Some(scopes) => {
+                    self.reader
+                        .recent_pages_global_for_scopes(limit, scopes)
+                        .await
+                }
+            }
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             return ok_json(&MemoryRecentResponse {
                 hits: Vec::new(),
                 global_hits,
@@ -2025,6 +2144,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Read)
             .await?;
         let hits = self
             .reader
@@ -2071,6 +2192,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Write)
             .await?;
         // The reason is free-text from the model; scrub it on the way in
         // like any other caller-supplied body.
@@ -2276,6 +2399,132 @@ impl AiMemoryServer {
             .map_err(|e| McpError::invalid_request(e.message().to_string(), None))
     }
 
+    fn access_principal(parts: &axum::http::request::Parts) -> AccessPrincipal {
+        AccessPrincipal::from_auth(
+            parts.extensions.get::<ai_memory_core::AuthLevel>().copied(),
+            parts.extensions.get::<ai_memory_core::UserId>().copied(),
+        )
+    }
+
+    /// Resolve the tool surface for the caller behind `parts`.
+    ///
+    /// Root and local principals keep the full surface: root is the
+    /// break-glass operator credential and stdio callers already own the data
+    /// directory, so restricting either would be theatre. Anonymous callers
+    /// never reach here — the auth middleware rejects them first — but they
+    /// are mapped to the empty-scope case rather than being special-cased, so
+    /// a future transport that forgets to authenticate does not silently
+    /// inherit an unrestricted surface.
+    async fn tool_surface(&self, parts: &axum::http::request::Parts) -> ToolSurface {
+        if !self.lane_scopes_enabled {
+            return ToolSurface::Unrestricted;
+        }
+        let AccessPrincipal::User(user_id) = Self::access_principal(parts) else {
+            return ToolSurface::Unrestricted;
+        };
+        match self.reader.identity_scopes(user_id).await {
+            Ok(scopes) => ToolSurface::from_scopes(scopes),
+            Err(error) => {
+                // Fail closed. A scope lookup that errors must not hand the
+                // caller the unrestricted surface it would have had before the
+                // gate existed; that would turn a transient database fault into
+                // a privilege escalation.
+                tracing::warn!(
+                    error = %error,
+                    "identity scope lookup failed; denying the full tool surface"
+                );
+                ToolSurface::Scoped(std::collections::BTreeSet::new())
+            }
+        }
+    }
+
+    /// Reject a tool call the caller's scopes do not cover.
+    ///
+    /// Deliberately independent of `list_tools`: hiding a tool from the
+    /// listing is a convenience for well-behaved clients, not a control. A
+    /// client that hard-codes a tool name, or one whose runtime offers no
+    /// per-server allowlist at all, still hits this check.
+    async fn require_tool_scope(
+        &self,
+        parts: &axum::http::request::Parts,
+        tool_name: &str,
+    ) -> Result<(), McpError> {
+        if self.tool_surface(parts).await.allows(tool_name) {
+            return Ok(());
+        }
+        // The message names the missing scope but not the caller's granted
+        // set: enough for an operator to fix the grant, not enough for a
+        // probing client to map the credential.
+        Err(McpError::invalid_request(
+            format!(
+                "credential scope does not permit tool '{tool_name}' (requires {})",
+                crate::tool_surface::classify_tool(tool_name).required_scope_str()
+            ),
+            None,
+        ))
+    }
+
+    async fn require_project_action(
+        &self,
+        parts: &axum::http::request::Parts,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        action: AccessAction,
+    ) -> Result<(), McpError> {
+        match ScopeAuthorizer::new(self.project_acl_enabled)
+            .check_project(
+                &self.reader,
+                Self::access_principal(parts),
+                workspace_id,
+                project_id,
+                action,
+            )
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+        {
+            AccessDecision::Allowed => Ok(()),
+            AccessDecision::Denied => Err(McpError::invalid_request(
+                "active project membership does not permit this operation",
+                None,
+            )),
+        }
+    }
+
+    async fn require_global_read(
+        &self,
+        parts: &axum::http::request::Parts,
+    ) -> Result<(), McpError> {
+        match ScopeAuthorizer::new(self.project_acl_enabled)
+            .check_global_read(Self::access_principal(parts))
+        {
+            AccessDecision::Allowed => Ok(()),
+            AccessDecision::Denied => Err(McpError::invalid_request(
+                "global repository access requires an authenticated user",
+                None,
+            )),
+        }
+    }
+
+    async fn authorized_global_scopes(
+        &self,
+        parts: &axum::http::request::Parts,
+    ) -> Result<Option<Vec<(WorkspaceId, ProjectId)>>, McpError> {
+        self.require_global_read(parts).await?;
+        let mut scopes = ScopeAuthorizer::new(self.project_acl_enabled)
+            .visible_project_scopes(&self.reader, Self::access_principal(parts))
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        if let Some(scopes) = scopes.as_mut()
+            && let Some(global) = lookup_global_scope(&self.reader)
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            && !scopes.contains(&global.as_tuple())
+        {
+            scopes.push(global.as_tuple());
+        }
+        Ok(scopes)
+    }
+
     /// Run the M8 forget sweep over episodic pages.
     #[tool(description = "Run the retention sweep: walk is_latest=1 \
         episodic pages, score them with the agentmemory-style retention \
@@ -2299,6 +2548,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Read)
             .await?;
         let report = run_sweep_with_breadth(
             &self.reader,
@@ -2338,6 +2589,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Write)
             .await?;
         let report = run_lint(
             &self.reader,
@@ -2726,12 +2979,16 @@ impl AiMemoryServer {
         let path = self.place_slot_write(path, &parts).await?;
         let (ws, proj) = match args.scope.as_deref().map(str::trim) {
             None | Some("") => {
-                self.write_target_ids_with_actor(
-                    args.workspace.as_deref(),
-                    args.project.as_deref(),
-                    &aps_actor,
-                )
-                .await?
+                let target = self
+                    .write_target_ids_with_actor(
+                        args.workspace.as_deref(),
+                        args.project.as_deref(),
+                        &aps_actor,
+                    )
+                    .await?;
+                self.require_project_action(&parts, target.0, target.1, AccessAction::Write)
+                    .await?;
+                target
             }
             Some("global") => {
                 if args
@@ -2747,6 +3004,9 @@ impl AiMemoryServer {
                         "scope: \"global\" cannot be combined with workspace/project",
                         None,
                     ));
+                }
+                if self.project_acl_enabled {
+                    self.require_admin_capability(&parts).await?;
                 }
                 ai_memory_store::create_global_scope(&self.writer)
                     .await
@@ -2883,6 +3143,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Read)
             .await?;
         // Diagnose cross-project scope-bleed: a read with no explicit scope
         // resolves to the active project, which may differ from the scope a
@@ -3026,6 +3288,8 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Write)
+            .await?;
 
         // Carry actor identity + loop-prevention skip list (same as write_page).
         // `Wiki::delete_page` stamps `op = Delete` regardless of what we pass.
@@ -3103,6 +3367,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Write)
             .await?;
         let open_questions = cap_handoff_list(
             args.open_questions.iter().map(|q| s.scrub(q)),
@@ -3202,6 +3468,8 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Write)
+            .await?;
         let actor_user = crate::actor::actor_from_parts(&parts)
             .identity_key()
             .map(|key| key.storage_key());
@@ -3218,6 +3486,24 @@ impl AiMemoryServer {
                 None => ai_memory_core::OwnerFilter::Unattributed,
             }
         };
+        let (accepting_session, accepting_agent) =
+            match Self::taskblu_execution_id_from_parts(&parts)? {
+                Some(execution_id) => {
+                    let (session, agent) = self
+                        .reader
+                        .execution_session_for_project(&execution_id, proj)
+                        .await
+                        .map_err(|e| McpError::invalid_params(e.to_string(), None))?
+                        .ok_or_else(|| {
+                            McpError::invalid_params(
+                                "execution header has no correlated native session in this project",
+                                None,
+                            )
+                        })?;
+                    (Some(session), agent)
+                }
+                None => (None, AgentKind::Other),
+            };
         let receiving_cwd = args.cwd;
         let handoff = self
             .reader
@@ -3252,8 +3538,8 @@ impl AiMemoryServer {
                         handoff_id: h.id,
                         workspace_id: ws,
                         project_id: proj,
-                        accepting_agent: AgentKind::Other,
-                        accepting_session: None,
+                        accepting_agent,
+                        accepting_session,
                         accepting_user: actor_user.clone(),
                         owner_filter,
                         receiving_cwd,
@@ -3293,6 +3579,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Write)
             .await?;
         // Resolve the cross-owner escape hatch before reading the object. A
         // non-admin request must not trigger admission webhooks or learn that
@@ -3365,6 +3653,8 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Read)
+            .await?;
         let counts = self
             .reader
             .status_counts_for_project(ws, proj)
@@ -3397,6 +3687,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Read)
             .await?;
         let actor = crate::actor::actor_from_parts(&parts);
         let visibility = self.slot_visibility_for(&parts);
@@ -3441,6 +3733,8 @@ impl AiMemoryServer {
                 args.project.as_deref(),
                 &aps_actor,
             )
+            .await?;
+        self.require_project_action(&parts, ws, proj, AccessAction::Read)
             .await?;
         let actor = crate::actor::actor_from_parts(&parts);
         let visibility = self.slot_visibility_for(&parts);
@@ -3574,6 +3868,46 @@ impl AiMemoryServer {
         });
         ok_json(&response)
     }
+
+    /// Grant, update, or suspend one registered user's project membership.
+    #[tool(
+        description = "Set a user's project membership. Administrator capability is required. The project must already exist; use role viewer, contributor, curator or owner. active=false suspends access without deleting provenance."
+    )]
+    async fn memory_project_membership_set(
+        &self,
+        Parameters(args): Parameters<ProjectMembershipSetArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        self.require_admin_capability(&parts).await?;
+        let role = ProjectRole::parse(&args.role)
+            .map_err(|error| McpError::invalid_request(error.to_string(), None))?;
+        let scope = lookup_existing_scope(&self.reader, &args.workspace, &args.project)
+            .await
+            .map_err(Self::scope_error)?;
+        let user = self
+            .reader
+            .find_user_by_username(args.username.clone())
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .ok_or_else(|| McpError::invalid_request("registered user not found", None))?;
+        self.writer
+            .upsert_project_membership(
+                user.id,
+                scope.workspace_id,
+                scope.project_id,
+                role,
+                args.active,
+            )
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        ok_json(&serde_json::json!({
+            "username": user.username,
+            "workspace": args.workspace,
+            "project": args.project,
+            "role": role.as_str(),
+            "active": args.active,
+        }))
+    }
 }
 
 fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
@@ -3613,6 +3947,11 @@ impl ServerHandler for AiMemoryServer {
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, McpError> {
         self.record_client_activity(&request.name, &context);
+        // Scope enforcement runs before dispatch, at the same choke point that
+        // already owns client identity. Putting it here rather than in each
+        // tool means a tool added later cannot forget to check.
+        let parts = OptionalParts::from_extensions(&context.extensions).0;
+        self.require_tool_scope(&parts, &request.name).await?;
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
     }
@@ -3624,7 +3963,16 @@ impl ServerHandler for AiMemoryServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let tools = self.tool_router.list_all();
+        let mut tools = self.tool_router.list_all();
+        // Filter the listing to the caller's capability scopes. This is the
+        // half a client can observe; `call_tool` enforces the same policy
+        // independently, so a client that ignores the listing gains nothing.
+        let surface = self
+            .tool_surface(&OptionalParts::from_extensions(&context.extensions).0)
+            .await;
+        if surface.is_enforcing() {
+            tools.retain(|tool| surface.allows(&tool.name));
+        }
         // rmcp injects `http::request::Parts` into request extensions in
         // both stateless and stateful modes, so the flavor marker is
         // available even without peer clientInfo.
@@ -4009,7 +4357,7 @@ fn test_optional_parts() -> OptionalParts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{Sanitized, Sanitizer};
+    use ai_memory_core::{NewHandoff, Sanitized, Sanitizer};
     use std::collections::BTreeSet;
 
     #[test]
@@ -4041,6 +4389,34 @@ mod tests {
         assert!(parts.extensions.get::<AuthLevel>().is_none());
         assert!(parts.extensions.get::<ai_memory_core::UserId>().is_none());
         assert!(parts.extensions.get::<ActorContext>().is_none());
+    }
+
+    #[test]
+    fn taskblu_execution_header_is_validated_and_unresolved_env_is_absent() {
+        let mut parts = test_parts_default();
+        assert_eq!(
+            AiMemoryServer::taskblu_execution_id_from_parts(&parts).unwrap(),
+            None
+        );
+        parts.headers.insert(
+            "x-taskblu-execution-id",
+            "${TASKBLU_EXECUTION_ID}".parse().unwrap(),
+        );
+        assert_eq!(
+            AiMemoryServer::taskblu_execution_id_from_parts(&parts).unwrap(),
+            None
+        );
+        parts
+            .headers
+            .insert("x-taskblu-execution-id", "paperclip:run-1".parse().unwrap());
+        assert_eq!(
+            AiMemoryServer::taskblu_execution_id_from_parts(&parts).unwrap(),
+            Some("paperclip:run-1".into())
+        );
+        parts
+            .headers
+            .insert("x-taskblu-execution-id", "invalid value".parse().unwrap());
+        assert!(AiMemoryServer::taskblu_execution_id_from_parts(&parts).is_err());
     }
 
     #[test]
@@ -4092,7 +4468,7 @@ mod tests {
         ActorContext, AuthLevel, NewObservation, NewPage, NewSession, NewUser, ObservationKind,
         PagePath, Tier,
     };
-    use ai_memory_store::Store;
+    use ai_memory_store::{IngestCorrelation, Store};
     use ai_memory_wiki::{Wiki, WritePageRequest};
     use tempfile::TempDir;
 
@@ -4546,6 +4922,7 @@ mod tests {
         "memory_feedback",
         "memory_lint",
         "memory_forget_sweep",
+        "memory_project_membership_set",
         "memory_install_self_routing",
     ];
 
@@ -8594,6 +8971,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hermes_handoff_accept_records_the_session_from_execution_header() {
+        let (_tmp, store, server, workspace, project) = setup_server().await;
+        let source = SessionId::new();
+        let receiver = SessionId::new();
+        for session in [source, receiver] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: session,
+                    workspace_id: workspace,
+                    project_id: project,
+                    agent_kind: AgentKind::Hermes,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+        }
+        let start = |session_id| {
+            Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: workspace,
+                    project_id: project,
+                    kind: ObservationKind::SessionStart,
+                    extension: None,
+                    source_event: None,
+                    title: "start".into(),
+                    body: "start".into(),
+                    importance: 1,
+                },
+                &Sanitizer::builtin(),
+            )
+        };
+        for (session, execution, key) in [
+            (source, "paperclip:source", "source-start"),
+            (receiver, "paperclip:receiver", "receiver-start"),
+        ] {
+            store
+                .writer
+                .insert_observation_ingest_correlated(
+                    start(session),
+                    key.into(),
+                    Some(IngestCorrelation {
+                        taskblu_execution_id: Some(execution.into()),
+                        paperclip_run_id: Some(execution.trim_start_matches("paperclip:").into()),
+                        session_id: Some(session),
+                        event_kind: Some("session-start".into()),
+                        source_event: None,
+                        capture_owner: Some("hermes-observer-bridge".into()),
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: workspace,
+                project_id: project,
+                from_session_id: Some(source),
+                from_agent: AgentKind::Hermes,
+                to_agent: None,
+                cwd: None,
+                summary: "resume safely".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+
+        let mut parts = test_parts_default();
+        parts.headers.insert(
+            "x-taskblu-execution-id",
+            "paperclip:receiver".parse().unwrap(),
+        );
+        server
+            .memory_handoff_accept(
+                Parameters(HandoffAcceptArgs {
+                    cwd: None,
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                }),
+                OptionalParts(parts),
+            )
+            .await
+            .unwrap();
+
+        let source_evidence = store
+            .reader
+            .execution_evidence("paperclip:source")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source_evidence.handoffs_accepted, 1);
+        assert_eq!(
+            source_evidence.handoff_accepting_session_ids,
+            vec![receiver.to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn handoff_begin_caps_manual_text_after_scrub() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         server
@@ -9949,5 +10431,315 @@ mod tests {
         let locked = buffer.lock().unwrap();
         assert!(locked.pending.is_empty());
         assert!(!locked.flush_scheduled);
+    }
+
+    /// Create a lane identity with the given capability scopes and return
+    /// request parts that authenticate as it.
+    async fn lane_identity(
+        store: &Store,
+        username: &str,
+        scopes: &[ai_memory_core::CapabilityScope],
+    ) -> axum::http::request::Parts {
+        let mut user = ai_memory_core::NewUser {
+            username: username.into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        // The token hash column is UNIQUE, so each identity needs a distinct
+        // one. Derive it from the username rather than using a constant: two
+        // lanes in one test are the whole point, and a constant collides.
+        let mut token_hash = [0u8; 32];
+        for (slot, byte) in token_hash.iter_mut().zip(username.bytes().cycle()) {
+            *slot = byte;
+        }
+        let user_id = store.writer.create_user(user, token_hash).await.unwrap();
+        store
+            .writer
+            .replace_identity_scopes(user_id, scopes.iter().copied().collect())
+            .await
+            .unwrap();
+        let mut parts = test_parts_default();
+        parts.extensions.insert(AuthLevel::User);
+        parts.extensions.insert(user_id);
+        parts
+    }
+
+    /// The Etapa A exit criterion, as an assertion.
+    ///
+    /// The measured defect this closes: the orchestrator lane saw four tools
+    /// and the worker lane saw all of them, with the *same credential against
+    /// the same server*, because the difference was imposed by the client. Two
+    /// credentials differing only in their granted scopes must now produce
+    /// different surfaces server-side.
+    #[tokio::test]
+    async fn lane_scope_decides_the_tool_surface_server_side() {
+        let (_tmp, store, server, _ws, _proj) = setup_server().await;
+        let server = server.with_lane_scopes(true);
+
+        let orchestrator = lane_identity(
+            &store,
+            "lane-orchestrator",
+            &[
+                ai_memory_core::CapabilityScope::MemoryRead,
+                ai_memory_core::CapabilityScope::MemoryHandoffAccept,
+            ],
+        )
+        .await;
+        let worker = lane_identity(
+            &store,
+            "lane-worker",
+            &[ai_memory_core::CapabilityScope::MemoryRead],
+        )
+        .await;
+
+        let orchestrator_surface = server.tool_surface(&orchestrator).await;
+        let worker_surface = server.tool_surface(&worker).await;
+
+        // Both lanes read.
+        assert!(orchestrator_surface.allows("memory_query"));
+        assert!(worker_surface.allows("memory_query"));
+        // Only the orchestrator accepts handoffs — the distinction the old
+        // shared `memory:read` would have erased.
+        assert!(orchestrator_surface.allows("memory_handoff_accept"));
+        assert!(!worker_surface.allows("memory_handoff_accept"));
+        // Neither writes.
+        assert!(!orchestrator_surface.allows("memory_write_page"));
+        assert!(!worker_surface.allows("memory_write_page"));
+    }
+
+    /// Invocation is gated independently of listing.
+    ///
+    /// Hiding a tool from `tools/list` helps a cooperative client and stops
+    /// nothing else. A caller that names the tool directly — which is exactly
+    /// what a runtime without a per-server allowlist does — must still be
+    /// refused.
+    #[tokio::test]
+    async fn a_tool_outside_the_scope_is_refused_even_when_named_directly() {
+        let (_tmp, store, server, _ws, _proj) = setup_server().await;
+        let server = server.with_lane_scopes(true);
+        let worker = lane_identity(
+            &store,
+            "lane-direct-call",
+            &[ai_memory_core::CapabilityScope::MemoryRead],
+        )
+        .await;
+
+        assert!(
+            server
+                .require_tool_scope(&worker, "memory_query")
+                .await
+                .is_ok()
+        );
+
+        let denied = server
+            .require_tool_scope(&worker, "memory_write_page")
+            .await
+            .expect_err("a read-only lane must not reach memory_write_page");
+        // The message names the scope needed, not the scopes held.
+        assert!(denied.message.contains("memory:write"));
+        assert!(!denied.message.contains("memory:read"));
+    }
+
+    /// Mutation proof: the gate can fail, and flipping exactly one input
+    /// flips the verdict.
+    ///
+    /// Three mutations, each isolating one reason the gate might be passing
+    /// for the wrong reason: the flag being off, the scope set being wrong,
+    /// and the identity being root.
+    #[tokio::test]
+    async fn the_scope_gate_can_actually_fail() {
+        let (_tmp, store, server, _ws, _proj) = setup_server().await;
+        let gated = server.clone().with_lane_scopes(true);
+        let reader = lane_identity(
+            &store,
+            "lane-mutation",
+            &[ai_memory_core::CapabilityScope::MemoryRead],
+        )
+        .await;
+
+        // Baseline: denied.
+        assert!(
+            gated
+                .require_tool_scope(&reader, "memory_write_page")
+                .await
+                .is_err()
+        );
+
+        // Mutation 1 — turn the feature off. The same credential and the same
+        // tool must now be allowed, proving the flag is what gates it.
+        let ungated = server.clone().with_lane_scopes(false);
+        assert!(
+            ungated
+                .require_tool_scope(&reader, "memory_write_page")
+                .await
+                .is_ok()
+        );
+
+        // Mutation 2 — widen the credential's scopes. Same flag, same tool.
+        let writer_lane = lane_identity(
+            &store,
+            "lane-mutation-writer",
+            &[
+                ai_memory_core::CapabilityScope::MemoryRead,
+                ai_memory_core::CapabilityScope::MemoryWrite,
+            ],
+        )
+        .await;
+        assert!(
+            gated
+                .require_tool_scope(&writer_lane, "memory_write_page")
+                .await
+                .is_ok()
+        );
+
+        // Mutation 3 — clear every scope. An unscoped identity is unrestricted,
+        // which is what keeps the capability opt-in per credential. If this
+        // ever starts denying, the promotion contract changed.
+        let unscoped = lane_identity(&store, "lane-unscoped", &[]).await;
+        assert!(
+            gated
+                .require_tool_scope(&unscoped, "memory_write_page")
+                .await
+                .is_ok()
+        );
+    }
+
+    /// Root keeps the whole surface: it is the break-glass operator
+    /// credential, and a lane scope must never be readable as a way to
+    /// restrict it.
+    #[tokio::test]
+    async fn root_is_never_restricted_by_lane_scopes() {
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        let server = server.with_lane_scopes(true);
+        let mut root_parts = test_parts_default();
+        root_parts.extensions.insert(AuthLevel::Root);
+        assert!(!server.tool_surface(&root_parts).await.is_enforcing());
+        assert!(
+            server
+                .require_tool_scope(&root_parts, "memory_delete_page")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn project_acl_denies_non_members_and_filters_global_search() {
+        let (tmp, store, server, workspace, allowed_project) = setup_server().await;
+        let denied_project = store
+            .writer
+            .get_or_create_project(workspace, "denied", None)
+            .await
+            .unwrap();
+        for (project_id, path) in [
+            (allowed_project, "allowed.md"),
+            (denied_project, "denied.md"),
+        ] {
+            store
+                .writer
+                .upsert_page(NewPage {
+                    workspace_id: workspace,
+                    project_id,
+                    path: PagePath::new(path).unwrap(),
+                    title: path.into(),
+                    body: "mcp-acl-marker".into(),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                    expires_at: None,
+                    entities: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        let mut user = ai_memory_core::NewUser {
+            username: "mcp-acl-user".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        let user_id = store.writer.create_user(user, [3; 32]).await.unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = server.with_wiki(wiki).with_project_acl(true);
+        let mut parts = test_parts_default();
+        parts.extensions.insert(AuthLevel::User);
+        parts.extensions.insert(user_id);
+
+        let denied = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "mcp-acl-marker".into(),
+                    limit: Some(10),
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                    scopes: Vec::new(),
+                    global: None,
+                    include_expired: None,
+                    explain: None,
+                }),
+                OptionalParts(parts.clone()),
+            )
+            .await;
+        assert!(denied.is_err());
+
+        server
+            .memory_project_membership_set(
+                Parameters(ProjectMembershipSetArgs {
+                    username: "mcp-acl-user".into(),
+                    workspace: "default".into(),
+                    project: "scratch".into(),
+                    role: "viewer".into(),
+                    active: true,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let global = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "mcp-acl-marker".into(),
+                    limit: Some(10),
+                    project: None,
+                    workspace: None,
+                    scopes: Vec::new(),
+                    global: Some(true),
+                    include_expired: None,
+                    explain: None,
+                }),
+                OptionalParts(parts),
+            )
+            .await
+            .unwrap();
+        let hits = call_tool_json(global)["global_hits"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["project_name"], "scratch");
+
+        let mut viewer_parts = test_parts_default();
+        viewer_parts.extensions.insert(AuthLevel::User);
+        viewer_parts.extensions.insert(user_id);
+        let write = server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/denied.md".into(),
+                    body: "# Denied".into(),
+                    title: None,
+                    tier: None,
+                    tags: Vec::new(),
+                    pinned: false,
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                    scope: None,
+                    expires_at: None,
+                }),
+                OptionalParts(viewer_parts),
+            )
+            .await;
+        assert!(write.is_err(), "viewer membership must not permit writes");
     }
 }

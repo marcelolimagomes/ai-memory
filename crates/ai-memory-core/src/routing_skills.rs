@@ -102,6 +102,10 @@ mod tests {
         ("memory_auto_improve", "ai-memory-learning-maintenance"),
         ("memory_lint", "ai-memory-learning-maintenance"),
         ("memory_forget_sweep", "ai-memory-learning-maintenance"),
+        (
+            "memory_project_membership_set",
+            "ai-memory-learning-maintenance",
+        ),
         ("memory_install_self_routing", "ai-memory-routing-install"),
     ];
 

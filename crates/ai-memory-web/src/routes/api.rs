@@ -1,12 +1,12 @@
 //! JSON routes for third-party read-only frontends.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use ai_memory_core::{PageId, PagePath, ProjectId, WorkspaceId};
 use ai_memory_store::{
-    BriefingSnapshot, HealthPage, PageHit, RelatedPage, ScopeName, ScopeResolutionError,
-    lookup_existing_scope, resolve_many_existing_scopes,
+    AccessAction, AccessDecision, BriefingSnapshot, HealthPage, PageHit, RelatedPage, ScopeName,
+    ScopeResolutionError, WorkspaceSummary, lookup_existing_scope, resolve_many_existing_scopes,
 };
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -92,12 +92,31 @@ fn with_no_store(resp: Response) -> Response {
     resp
 }
 
-async fn workspaces_handler(State(state): State<Arc<WebState>>) -> Result<Response, Response> {
-    let workspaces = state
-        .reader
-        .list_workspaces_with_stats()
+async fn workspaces_handler(
+    State(state): State<Arc<WebState>>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
+) -> Result<Response, Response> {
+    let visible = state
+        .visible_project_names(auth_level(auth), user_id_value(user_id))
         .await
         .map_err(internal_error)?;
+    let workspaces = if let Some(visible) = visible {
+        workspace_summaries_for_projects(
+            state
+                .reader
+                .list_projects_with_stats()
+                .await
+                .map_err(internal_error)?,
+            &visible,
+        )
+    } else {
+        state
+            .reader
+            .list_workspaces_with_stats()
+            .await
+            .map_err(internal_error)?
+    };
     Ok(with_cache(
         Json(workspaces).into_response(),
         LIST_CACHE_MAX_AGE,
@@ -109,12 +128,26 @@ async fn workspaces_handler(State(state): State<Arc<WebState>>) -> Result<Respon
 /// path. The UI builds nodes from the endpoints (and may aggregate to a
 /// project-level dependency graph). Global for now; project scoping is a
 /// follow-up query param.
-async fn graph_handler(State(state): State<Arc<WebState>>) -> Result<Response, Response> {
-    let edges = state
+async fn graph_handler(
+    State(state): State<Arc<WebState>>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
+) -> Result<Response, Response> {
+    let visible = state
+        .visible_project_names(auth_level(auth), user_id_value(user_id))
+        .await
+        .map_err(internal_error)?;
+    let mut edges = state
         .reader
         .cross_project_edges(None)
         .await
         .map_err(internal_error)?;
+    if let Some(visible) = visible {
+        edges.retain(|edge| {
+            visible.contains(&(edge.from_workspace.clone(), edge.from_project.clone()))
+                && visible.contains(&(edge.to_workspace.clone(), edge.to_project.clone()))
+        });
+    }
     Ok(with_cache(
         Json(serde_json::json!({ "edges": edges })).into_response(),
         LIST_CACHE_MAX_AGE,
@@ -124,6 +157,8 @@ async fn graph_handler(State(state): State<Arc<WebState>>) -> Result<Response, R
 async fn projects_handler(
     State(state): State<Arc<WebState>>,
     Query(query): Query<ProjectListQuery>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
 ) -> Result<Response, Response> {
     let workspace = query
         .workspace
@@ -139,6 +174,20 @@ async fn projects_handler(
         state.reader.list_projects_with_stats().await
     }
     .map_err(internal_error)?;
+    let projects = if let Some(visible) = state
+        .visible_project_names(auth_level(auth), user_id_value(user_id))
+        .await
+        .map_err(internal_error)?
+    {
+        projects
+            .into_iter()
+            .filter(|project| {
+                visible.contains(&(project.workspace_name.clone(), project.project_name.clone()))
+            })
+            .collect()
+    } else {
+        projects
+    };
     Ok(with_cache(
         Json(projects).into_response(),
         LIST_CACHE_MAX_AGE,
@@ -148,8 +197,18 @@ async fn projects_handler(
 async fn pages_handler(
     State(state): State<Arc<WebState>>,
     Path((workspace, project)): Path<(String, String)>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
 ) -> Result<Response, Response> {
-    let _ = lookup_project(&state, &workspace, &project).await?;
+    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    require_project_read(
+        &state,
+        auth.map(|axum::Extension(level)| level),
+        user_id.map(|axum::Extension(id)| id),
+        workspace_id,
+        project_id,
+    )
+    .await?;
     let pages = state
         .reader
         .list_pages(&workspace, &project)
@@ -165,6 +224,8 @@ async fn page_handler(
     State(state): State<Arc<WebState>>,
     headers: axum::http::HeaderMap,
     Path((workspace, project, path)): Path<(String, String, String)>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
 ) -> Result<Response, Response> {
     let meta = state
         .reader
@@ -172,6 +233,14 @@ async fn page_handler(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| not_found("page not found"))?;
+    require_project_read(
+        &state,
+        auth.map(|axum::Extension(level)| level),
+        user_id.map(|axum::Extension(id)| id),
+        meta.workspace_id,
+        meta.project_id,
+    )
+    .await?;
 
     let page_path = PagePath::new(&path)
         .map_err(|e| json_error(StatusCode::BAD_REQUEST, format!("invalid path: {e}")))?;
@@ -259,19 +328,35 @@ async fn page_handler(
 async fn search_handler(
     State(state): State<Arc<WebState>>,
     RawQuery(raw_query): RawQuery,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
 ) -> Result<Response, Response> {
     let query = SearchQuery::from_raw(raw_query.as_deref()).map_err(ApiFailure::into_response)?;
     let request = query
         .try_into_request()
         .map_err(ApiFailure::into_response)?;
-    search_with_request(&state, request).await
+    search_with_request(
+        &state,
+        request,
+        auth.map(|axum::Extension(level)| level),
+        user_id.map(|axum::Extension(id)| id),
+    )
+    .await
 }
 
 async fn search_post_handler(
     State(state): State<Arc<WebState>>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Response, Response> {
-    search_with_request(&state, request).await
+    search_with_request(
+        &state,
+        request,
+        auth.map(|axum::Extension(level)| level),
+        user_id.map(|axum::Extension(id)| id),
+    )
+    .await
 }
 
 // NOTE (deferred): vector/semantic search. `ReaderPool::hybrid_search` already
@@ -286,6 +371,8 @@ async fn search_post_handler(
 async fn search_with_request(
     state: &WebState,
     request: SearchRequest,
+    auth: Option<ai_memory_core::AuthLevel>,
+    user_id: Option<ai_memory_core::UserId>,
 ) -> Result<Response, Response> {
     let term = request.q.trim().to_owned();
     if term.is_empty() {
@@ -308,7 +395,32 @@ async fn search_with_request(
             "scopes cannot be combined with workspace/project",
         ));
     }
-    let hits = match scoped_search_mode(state, &request).await? {
+    let mode = match scoped_search_mode(state, &request).await? {
+        SearchMode::Global => match state
+            .visible_project_scopes(auth, user_id)
+            .await
+            .map_err(internal_error)?
+        {
+            None => SearchMode::Global,
+            Some(scopes) => SearchMode::Scoped(
+                scopes
+                    .into_iter()
+                    .map(|(workspace_id, project_id)| ResolvedSearchScope {
+                        workspace_id,
+                        project_id,
+                    })
+                    .collect(),
+            ),
+        },
+        SearchMode::Scoped(scopes) => {
+            for scope in &scopes {
+                require_project_read(state, auth, user_id, scope.workspace_id, scope.project_id)
+                    .await?;
+            }
+            SearchMode::Scoped(scopes)
+        }
+    };
+    let hits = match mode {
         SearchMode::Global => state.reader.search_pages(term, limit).await,
         SearchMode::Scoped(scopes) => search_scopes(state, scopes, term, limit).await,
     }
@@ -318,6 +430,23 @@ async fn search_with_request(
         Json(enrich_hits(state, hits).await?).into_response(),
         LIST_CACHE_MAX_AGE,
     ))
+}
+
+async fn require_project_read(
+    state: &WebState,
+    level: Option<ai_memory_core::AuthLevel>,
+    user_id: Option<ai_memory_core::UserId>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> Result<(), Response> {
+    match state
+        .check_project(level, user_id, workspace_id, project_id, AccessAction::Read)
+        .await
+        .map_err(internal_error)?
+    {
+        AccessDecision::Allowed => Ok(()),
+        AccessDecision::Denied => Err(not_found("project not found")),
+    }
 }
 
 async fn scoped_search_mode(
@@ -419,8 +548,18 @@ async fn recent_handler(
     State(state): State<Arc<WebState>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
 ) -> Result<Response, Response> {
-    let _ = lookup_project(&state, &workspace, &project).await?;
+    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    require_project_read(
+        &state,
+        auth.map(|axum::Extension(level)| level),
+        user_id.map(|axum::Extension(id)| id),
+        workspace_id,
+        project_id,
+    )
+    .await?;
     let mut pages = state
         .reader
         .list_pages(&workspace, &project)
@@ -436,8 +575,18 @@ async fn briefing_handler(
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
 ) -> Result<Response, Response> {
     let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    require_project_read(
+        &state,
+        auth.map(|axum::Extension(level)| level),
+        user_id.map(|axum::Extension(id)| id),
+        workspace_id,
+        project_id,
+    )
+    .await?;
     let briefing = state
         .reader
         .briefing_for_project(
@@ -456,7 +605,17 @@ async fn overview_handler(
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path(workspace): Path<String>,
     Query(query): Query<LimitQuery>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
 ) -> Result<Response, Response> {
+    // This endpoint aggregates every project in a workspace. Until it has a
+    // project-scoped aggregation query, never expose cross-project counts or
+    // handoffs to a member who may only belong to a subset of that workspace.
+    if state.project_acl_enabled && auth_level(auth) != Some(ai_memory_core::AuthLevel::Root) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "workspace-wide overview requires root when project ACL is enabled",
+        ));
+    }
     let workspace_id = state
         .reader
         .find_workspace(workspace.clone())
@@ -705,8 +864,17 @@ async fn handoffs_handler(
     auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<HandoffListQuery>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
 ) -> Result<Response, Response> {
     let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    require_project_read(
+        &state,
+        auth.as_ref().map(|axum::Extension(level)| *level),
+        user_id.map(|axum::Extension(id)| id),
+        workspace_id,
+        project_id,
+    )
+    .await?;
     let handoff_state = match query.state.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(raw) => Some(raw.parse::<ai_memory_core::HandoffState>().map_err(|_| {
@@ -768,8 +936,18 @@ async fn project_overview_handler(
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
 ) -> Result<Response, Response> {
     let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    require_project_read(
+        &state,
+        auth.map(|axum::Extension(level)| level),
+        user_id.map(|axum::Extension(id)| id),
+        workspace_id,
+        project_id,
+    )
+    .await?;
     let limit = query.limit.clamp(1, 100);
 
     // Same scoping as `overview_handler`; computed once and reused for the
@@ -840,6 +1018,44 @@ async fn lookup_project(
             }
             other => scope_error_response(other),
         })
+}
+
+fn auth_level(
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+) -> Option<ai_memory_core::AuthLevel> {
+    auth.map(|axum::Extension(level)| level)
+}
+
+fn user_id_value(
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
+) -> Option<ai_memory_core::UserId> {
+    user_id.map(|axum::Extension(id)| id)
+}
+
+fn workspace_summaries_for_projects(
+    projects: Vec<ai_memory_store::ProjectSummary>,
+    visible: &HashSet<(String, String)>,
+) -> Vec<WorkspaceSummary> {
+    let mut grouped = BTreeMap::<String, WorkspaceSummary>::new();
+    for project in projects {
+        if !visible.contains(&(project.workspace_name.clone(), project.project_name.clone())) {
+            continue;
+        }
+        let entry = grouped
+            .entry(project.workspace_name.clone())
+            .or_insert_with(|| WorkspaceSummary {
+                workspace_name: project.workspace_name.clone(),
+                project_count: 0,
+                page_count: 0,
+                last_updated: None,
+            });
+        entry.project_count += 1;
+        entry.page_count += project.page_count;
+        if project.last_updated > entry.last_updated {
+            entry.last_updated = project.last_updated;
+        }
+    }
+    grouped.into_values().collect()
 }
 
 async fn enrich_hits(state: &WebState, hits: Vec<PageHit>) -> Result<Vec<ApiSearchHit>, Response> {

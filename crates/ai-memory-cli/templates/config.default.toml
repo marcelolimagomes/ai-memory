@@ -35,6 +35,19 @@ log_level = "info"
 # --capture-assistant`. Env equivalent: `AI_MEMORY_CAPTURE_ASSISTANT=true`.
 # capture_assistant = false
 
+# Enforce durable project memberships at MCP, hook and web/API seams. HTTP
+# users without an active role fail closed; local stdio remains compatible.
+# Env equivalent: `AI_MEMORY_PROJECT_ACL_ENABLED=true`.
+# project_acl_enabled = false
+
+# Enforce capability scopes on the MCP tool surface. A credential's granted
+# scopes decide which tools it may list AND invoke; the two checks are
+# independent, so a client that ignores tools/list gains nothing by hard-coding
+# a tool name. Identities with no granted scope stay unrestricted, so switching
+# this on denies nothing until `ai-memory user scope set` grants a first scope.
+# Env equivalent: `AI_MEMORY_LANE_SCOPES_ENABLED=true`.
+# lane_scopes_enabled = false
+
 # Optional final LLM relevance pass for project/scopes memory_query calls.
 # Requires an LLM provider and adds at most one provider call per eligible
 # query. The bounded query, page titles, and search snippets are sent to that

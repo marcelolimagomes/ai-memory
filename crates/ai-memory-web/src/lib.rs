@@ -34,8 +34,8 @@ mod state;
 mod templates;
 
 pub use mount::{
-    WebMountSpec, inject_base_href, inject_base_path_meta, mount_web_router, normalize_prefix,
-    web_base_href,
+    WebMountSpec, inject_base_href, inject_base_path_meta, mount_web_router,
+    mount_web_router_with_acl, normalize_prefix, web_base_href,
 };
 pub use state::WebState;
 
@@ -43,7 +43,12 @@ pub use state::WebState;
 /// `nest("/web", router)` it onto the existing axum app, OR mount at
 /// `/` if the web UI is the only HTTP surface.
 pub fn router(reader: ReaderPool, wiki: Wiki) -> Router {
-    let state = Arc::new(WebState::new(reader, wiki));
+    router_with_acl(reader, wiki, false)
+}
+
+/// Build the browser router with opt-in project authorization.
+pub fn router_with_acl(reader: ReaderPool, wiki: Wiki, project_acl_enabled: bool) -> Router {
+    let state = Arc::new(WebState::new_with_acl(reader, wiki, project_acl_enabled));
     routes::build(state)
 }
 
@@ -53,7 +58,12 @@ pub fn router(reader: ReaderPool, wiki: Wiki) -> Router {
 /// so custom frontends can browse memory without reading SQLite or wiki
 /// files directly.
 pub fn api_router(reader: ReaderPool, wiki: Wiki) -> Router {
-    let state = Arc::new(WebState::new(reader, wiki));
+    api_router_with_acl(reader, wiki, false)
+}
+
+/// Build the JSON router with opt-in project authorization.
+pub fn api_router_with_acl(reader: ReaderPool, wiki: Wiki, project_acl_enabled: bool) -> Router {
+    let state = Arc::new(WebState::new_with_acl(reader, wiki, project_acl_enabled));
     routes::build_api(state)
 }
 

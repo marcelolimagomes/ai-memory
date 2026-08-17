@@ -37,6 +37,14 @@ getrandom.workspace = true
 # timestamps + delta against now). The rest of the crate doesn't
 # need a clock dep.
 jiff.workspace = true
+# Federated (OIDC) authentication: validate lane tokens against the IdP's JWKS.
+# `rust_crypto` rather than the aws-lc-rs backend so the build stays pure Rust
+# and does not acquire a C toolchain requirement. Licence checked against
+# deny.toml before adoption: MIT.
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
+# JWKS retrieval only. Inherits the workspace's rustls-based feature set, so no
+# native-tls is pulled in.
+reqwest.workspace = true
 
 [dev-dependencies]
 ai-memory-core.workspace = true

@@ -119,6 +119,18 @@ pub struct Config {
     /// `std::env::var` call (invariant: one config-read path).
     #[serde(default)]
     pub base_path: String,
+    /// Enable server-side project membership authorization for MCP, hooks and
+    /// web/API transports. Disabled preserves historical single-tenant mode.
+    pub project_acl_enabled: bool,
+    /// Enable server-side capability-scope enforcement of the MCP tool
+    /// surface. Disabled preserves the historical behaviour where every
+    /// authenticated caller reaches every tool.
+    ///
+    /// Turning this on alone changes nothing observable: an identity with no
+    /// granted scopes stays unrestricted, so enforcement begins only when an
+    /// operator grants a first scope with `ai-memory user scope set`.
+    #[serde(default)]
+    pub lane_scopes_enabled: bool,
     /// Operator home directory, captured once here (the single config-read
     /// path) from `AI_MEMORY_HOME` or `$HOME`. Used to keep the cwd->project resolver and the
     /// startup heal from treating `$HOME` as a prefix-match catch-all
@@ -448,6 +460,43 @@ pub struct AuthSettings {
     ///
     /// Only set this when the server is reachable *only* through that proxy.
     pub actor_proxy_bearer_token: Option<String>,
+    /// Trusted OIDC issuer for federated lane tokens, e.g.
+    /// `https://auth.taskblu.com/realms/taskblu`.
+    ///
+    /// The federated rung activates only when this, [`Self::federated_audience`]
+    /// and [`Self::federated_jwks_uri`] are all present. Any one missing leaves
+    /// the rung off — a half-configured issuer must not authenticate anybody.
+    ///
+    /// Compared verbatim against the token's `iss`. A trailing-slash mismatch
+    /// is a rejection, not something to normalise away.
+    pub federated_issuer: Option<String>,
+    /// Required `aud` on a federated token. A token minted for another
+    /// audience is refused even with a valid signature, which is what stops a
+    /// token issued for a different service from being replayed here.
+    pub federated_audience: Option<String>,
+    /// Absolute JWKS URL of the trusted issuer.
+    pub federated_jwks_uri: Option<String>,
+}
+
+impl AuthSettings {
+    /// The federated configuration, when it is complete.
+    ///
+    /// Returns `None` unless all three fields are set, so a partially
+    /// configured issuer disables the rung instead of half-enabling it.
+    #[must_use]
+    pub fn federated(&self) -> Option<(String, String, String)> {
+        let issuer = self.federated_issuer.as_deref()?.trim();
+        let audience = self.federated_audience.as_deref()?.trim();
+        let jwks_uri = self.federated_jwks_uri.as_deref()?.trim();
+        if issuer.is_empty() || audience.is_empty() || jwks_uri.is_empty() {
+            return None;
+        }
+        Some((
+            issuer.to_string(),
+            audience.to_string(),
+            jwks_uri.to_string(),
+        ))
+    }
 }
 
 /// `[auto_scope]` — controls how the hook-published "currently active
@@ -490,6 +539,8 @@ impl Default for Config {
             bind: DEFAULT_BIND.into(),
             server_url: DEFAULT_SERVER_URL.into(),
             base_path: String::new(),
+            project_acl_enabled: false,
+            lane_scopes_enabled: false,
             home_dir: None,
             log_level: "info".into(),
             llm_provider: None,

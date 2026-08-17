@@ -21,10 +21,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::{
     UserAddArgs, UserArgs, UserCommand, UserExpireArgs, UserListArgs, UserReviveArgs,
-    UserRotateTokenArgs,
+    UserRotateTokenArgs, UserScopeArgs, UserScopeCommand, UserScopeSetArgs, UserScopeShowArgs,
 };
 use crate::config::Config;
-use crate::http_client::{ServerEndpoint, get_json, post_json};
+use crate::http_client::{ServerEndpoint, get_json, post_json, put_json};
 
 /// Mirrors `ai_memory_core::User` on the server side. Repeated here
 /// rather than imported to keep the CLI <-> server contract explicit
@@ -75,7 +75,100 @@ pub async fn run(config: &Config, args: UserArgs) -> Result<()> {
         UserCommand::Expire(args) => expire(&ep, args).await,
         UserCommand::Revive(args) => revive(&ep, args).await,
         UserCommand::RotateToken(args) => rotate_token(&ep, args).await,
+        UserCommand::Scope(args) => scope(&ep, args).await,
     }
+}
+
+/// Mirrors the server's scope response. `enforcing` is carried explicitly so
+/// the CLI can say out loud that an empty scope set means unrestricted — the
+/// one place where "nothing configured" and "nothing allowed" look alike and
+/// mean the opposite.
+#[derive(Debug, Deserialize, Serialize)]
+struct ScopesRow {
+    username: String,
+    scopes: Vec<String>,
+    enforcing: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SetScopesBody {
+    scopes: Vec<String>,
+}
+
+async fn scope(ep: &ServerEndpoint, args: UserScopeArgs) -> Result<()> {
+    match args.command {
+        UserScopeCommand::Show(args) => scope_show(ep, args).await,
+        UserScopeCommand::Set(args) => scope_set(ep, args).await,
+    }
+}
+
+async fn scope_show(ep: &ServerEndpoint, args: UserScopeShowArgs) -> Result<()> {
+    let username = args.username.trim();
+    let resp: ScopesRow = get_json(ep, &format!("/admin/users/{username}/scopes"), &[])
+        .await
+        .context("reading user scopes")?;
+    report_scopes(&resp, args.json, "scopes")
+}
+
+async fn scope_set(ep: &ServerEndpoint, args: UserScopeSetArgs) -> Result<()> {
+    let username = args.username.trim();
+    // Parse client-side too. The server is the authority, but failing here
+    // means a typo never reaches the writer, and the operator sees the bad
+    // token rather than an HTTP status.
+    let scopes: Vec<String> = if args.clear {
+        Vec::new()
+    } else {
+        let raw = args.scopes.as_deref().unwrap_or_default();
+        match ai_memory_core::CapabilityScope::parse_set(raw) {
+            Ok(parsed) => parsed.iter().map(|s| s.as_str().to_string()).collect(),
+            Err(bad) => bail!(
+                "unknown capability scope '{bad}'. Known scopes: {}",
+                ai_memory_core::CapabilityScope::ALL
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    };
+    let body = SetScopesBody { scopes };
+    let resp: ScopesRow = put_json(ep, &format!("/admin/users/{username}/scopes"), &body)
+        .await
+        .context("setting user scopes")?;
+    report_scopes(&resp, args.json, "updated scopes")
+}
+
+fn report_scopes(resp: &ScopesRow, as_json: bool, label: &str) -> Result<()> {
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(resp)?);
+        return Ok(());
+    }
+    let mut stderr = io::stderr().lock();
+    if resp.enforcing {
+        let _ = writeln!(
+            stderr,
+            "✓ {label} for '{}': {}",
+            resp.username,
+            resp.scopes.join(" ")
+        );
+        let _ = writeln!(
+            stderr,
+            "  The credential reaches only the tools these scopes cover."
+        );
+    } else {
+        // Never let a cleared credential read as a locked-down one.
+        let _ = writeln!(
+            stderr,
+            "! {label} for '{}': NONE — the credential is UNRESTRICTED and \
+             reaches every tool.",
+            resp.username
+        );
+        let _ = writeln!(
+            stderr,
+            "  Grant at least one scope to start enforcing on this identity."
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]

@@ -733,8 +733,14 @@ mod tests {
         }
     }
 
+    /// The decay tombstone index arrived from upstream as V49, but this fork
+    /// had already spent V49/V50 on the project-ACL and execution-evidence
+    /// work, and those are applied in the deployed database. Renumbering an
+    /// applied migration breaks refinery's recorded history, so the upstream
+    /// one moved to V54 instead. The assertion itself is unchanged: run to 48,
+    /// then run everything that follows.
     #[test]
-    fn v48_to_v49_replaces_the_decay_tombstone_index_predicate() {
+    fn v48_onwards_replaces_the_decay_tombstone_index_predicate() {
         let mut conn = Connection::open_in_memory().unwrap();
         run_to(&mut conn, 48).unwrap();
 

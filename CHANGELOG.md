@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Federated (OIDC) authentication rung. A `Authorization: Bearer` value shaped
+  like a JWT is validated against a trusted issuer's JWKS and resolved to a
+  local identity through an explicit `(issuer, subject)` binding — a subject
+  the IdP admits but nobody bound here is refused, never auto-provisioned.
+  Only `RS256`/`ES256` are verified; `HS256` is refused because with JWKS the
+  verification key is public, so a symmetric algorithm would let anyone
+  holding it mint tokens. Keys are additionally matched to the header
+  algorithm, so a `kid` hit cannot be used for key confusion. Requires
+  `[auth].federated_issuer` + `federated_audience` + `federated_jwks_uri`
+  together; any one missing leaves the rung off. Capability still comes from
+  the identity's scopes, so the two gates are conjunctive.
+- Revocation denylist by `jti` (one token) or `subject` (every token an
+  identity holds), via `POST /admin/revocations`. Re-revoking never shortens an
+  existing window, and a denylist that cannot be read is treated as revoked
+  rather than empty.
+- `PUT /admin/users/{username}/federated-identity` binds an OIDC subject to a
+  local user.
+- Capability scopes decide the MCP tool surface **server-side**. An identity's
+  granted scopes (`memory:read`, `memory:handoff.accept`, `memory:write`,
+  `memory:curate`, `memory:admin`) filter `tools/list` and, independently,
+  gate `tools/call` — so a client that hard-codes a tool name, or a runtime
+  with no per-server allowlist, gains nothing over one that respects the
+  listing. Off by default (`lane_scopes_enabled`), and an identity with no
+  granted scope stays unrestricted, so enabling the flag denies nothing until
+  an operator grants a first scope with `ai-memory user scope set`. Tool names
+  that nobody classified fail closed as `memory:admin`.
+- Execution registry (`POST /admin/executions`, `POST /admin/executions/{id}/close`).
+  An execution id arriving in a request is a claim, not a credential: the
+  server resolves it against a registration that must exist, belong to the
+  calling identity, and be neither closed nor expired. Workspace and project
+  are read from the registration rather than from anything the caller sends.
+  Every rejection reason collapses into one client-facing message so the
+  registry cannot be used to enumerate other identities' executions.
+
+### Fixed
+- The `ai-memory-cli` test binary compiles again: a test still called
+  `mount_web_router` after the project-ACL work replaced it with
+  `mount_web_router_with_acl`, so the whole crate's tests were unbuildable.
+- MCP handoff acceptance now binds `X-Taskblu-Execution-Id` to the single
+  native session already recorded for that execution and project. Missing or
+  ambiguous correlations fail closed, so Hermes-style clients that cannot
+  consume SessionStart output leave metadata-only evidence of the actual
+  receiving session instead of an unattributed acceptance (#389).
+
 ## [1.26.1] - 2026-08-14
 
 ### Fixed

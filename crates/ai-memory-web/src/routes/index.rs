@@ -13,15 +13,29 @@ use crate::templates::{ProjectCard, ProjectsView, humanize, project_href};
 /// Handler for `GET /`.
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    user_id: Option<axum::Extension<ai_memory_core::UserId>>,
 ) -> Result<Html<String>, StatusCode> {
     let summaries = state
         .reader
         .list_projects_with_stats()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let visible = state
+        .visible_project_names(
+            auth.map(|axum::Extension(level)| level),
+            user_id.map(|axum::Extension(id)| id),
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let projects = summaries
         .into_iter()
+        .filter(|summary| {
+            visible.as_ref().is_none_or(|visible| {
+                visible.contains(&(summary.workspace_name.clone(), summary.project_name.clone()))
+            })
+        })
         .map(|s| {
             let last_updated_relative = s.last_updated.as_deref().map(humanize).unwrap_or_default();
             let href = project_href(&s.workspace_name, &s.project_name);

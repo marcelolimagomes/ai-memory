@@ -1015,6 +1015,58 @@ pub struct HealthDetail {
     pub orphans: Vec<HealthPage>,
 }
 
+/// Count of durable hook receipts for one metadata-only event category.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExecutionEventCount {
+    /// Closed observation-kind label.
+    pub event_kind: String,
+    /// Extension event name, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_event: Option<String>,
+    /// Number of committed receipts in this category.
+    pub count: u64,
+}
+
+/// Aggregated evidence that a cross-component execution reached ai-memory.
+/// Observation bodies, prompts, tool arguments and credentials are excluded.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExecutionEvidence {
+    /// Canonical requested execution identifier.
+    pub taskblu_execution_id: String,
+    /// Distinct Paperclip run identifiers observed.
+    pub paperclip_run_ids: Vec<String>,
+    /// Distinct workspace names touched.
+    pub workspaces: Vec<String>,
+    /// Distinct project names touched.
+    pub projects: Vec<String>,
+    /// Distinct native agent sessions observed.
+    pub session_ids: Vec<String>,
+    /// Distinct components that declared capture ownership.
+    pub capture_owners: Vec<String>,
+    /// Durable receipt counts grouped by event category.
+    pub events: Vec<ExecutionEventCount>,
+    /// Total durable keyed receipts.
+    pub receipts: u64,
+    /// Receipts whose downstream hook side effects completed.
+    pub completed_receipts: u64,
+    /// Receipts still awaiting downstream completion.
+    pub pending_receipts: u64,
+    /// Number of deduplicated delivery attempts.
+    pub replay_count: u64,
+    /// Correlated sessions with a durable end timestamp.
+    pub finalized_sessions: u64,
+    /// Handoffs created by correlated sessions.
+    pub handoffs_created: u64,
+    /// Correlated handoffs that have been accepted.
+    pub handoffs_accepted: u64,
+    /// Native sessions that consumed a correlated handoff.
+    pub handoff_accepting_session_ids: Vec<String>,
+    /// Earliest receipt timestamp in Unix microseconds.
+    pub first_seen_at: i64,
+    /// Latest receipt timestamp in Unix microseconds.
+    pub last_seen_at: i64,
+}
+
 /// Cheap, cloneable read-only connection pool handle.
 #[derive(Clone)]
 pub struct ReaderPool {
@@ -1028,6 +1080,176 @@ struct Inner {
 }
 
 impl ReaderPool {
+    /// Resolve the single native session correlated to an execution in one
+    /// project. A missing receipt is `None`; more than one distinct session is
+    /// rejected so callers never guess which concurrent session consumed a
+    /// single-use handoff.
+    pub async fn execution_session_for_project(
+        &self,
+        execution_id: &str,
+        project_id: ProjectId,
+    ) -> StoreResult<Option<(SessionId, AgentKind)>> {
+        let execution_id = execution_id.to_owned();
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT i.session_id, s.agent_kind FROM ingest_keys i \
+                 JOIN sessions s ON s.id = i.session_id \
+                 WHERE i.taskblu_execution_id = ?1 AND i.project_id = ?2 \
+                   AND i.session_id IS NOT NULL ORDER BY i.session_id LIMIT 2",
+            )?;
+            let rows = stmt
+                .query_map(params![execution_id, project_id.as_bytes()], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            match rows.as_slice() {
+                [] => Ok(None),
+                [(id, agent)] => SessionId::from_slice(id)
+                    .map(|id| Some((id, AgentKind::from_wire(agent))))
+                    .map_err(StoreError::from),
+                _ => Err(StoreError::InvalidState(format!(
+                    "execution '{execution_id}' is correlated to multiple sessions in one project"
+                ))),
+            }
+        })
+        .await
+    }
+
+    /// Return metadata-only durable evidence for one TaskBlu execution.
+    pub async fn execution_evidence(
+        &self,
+        execution_id: &str,
+    ) -> StoreResult<Option<ExecutionEvidence>> {
+        let execution_id = execution_id.to_owned();
+        self.with_conn(move |conn| {
+            let summary = conn.query_row(
+                "SELECT COUNT(*), COUNT(completed_at), \
+                     COALESCE(SUM(replay_count), 0), MIN(seen_at), MAX(seen_at) \
+                     FROM ingest_keys WHERE taskblu_execution_id = ?1",
+                [&execution_id],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )?;
+            let (receipts, completed_receipts, replay_count, first_seen, last_seen) = summary;
+            let (Some(first_seen_at), Some(last_seen_at)) = (first_seen, last_seen) else {
+                return Ok(None);
+            };
+
+            let collect_strings = |sql: &str| -> StoreResult<Vec<String>> {
+                let mut stmt = conn.prepare(sql)?;
+                let rows = stmt.query_map([&execution_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+            };
+            let paperclip_run_ids = collect_strings(
+                "SELECT DISTINCT paperclip_run_id FROM ingest_keys \
+                 WHERE taskblu_execution_id = ?1 AND paperclip_run_id IS NOT NULL \
+                 ORDER BY paperclip_run_id",
+            )?;
+            let workspaces = collect_strings(
+                "SELECT DISTINCT w.name FROM ingest_keys i \
+                 JOIN projects p ON p.id = i.project_id \
+                 JOIN workspaces w ON w.id = p.workspace_id \
+                 WHERE i.taskblu_execution_id = ?1 ORDER BY w.name",
+            )?;
+            let projects = collect_strings(
+                "SELECT DISTINCT p.name FROM ingest_keys i JOIN projects p ON p.id = i.project_id \
+                 WHERE i.taskblu_execution_id = ?1 ORDER BY p.name",
+            )?;
+            let capture_owners = collect_strings(
+                "SELECT DISTINCT capture_owner FROM ingest_keys \
+                 WHERE taskblu_execution_id = ?1 AND capture_owner IS NOT NULL \
+                 ORDER BY capture_owner",
+            )?;
+
+            let mut session_stmt = conn.prepare(
+                "SELECT DISTINCT session_id FROM ingest_keys \
+                 WHERE taskblu_execution_id = ?1 AND session_id IS NOT NULL ORDER BY session_id",
+            )?;
+            let session_blobs = session_stmt
+                .query_map([&execution_id], |row| row.get::<_, Vec<u8>>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let session_ids = session_blobs
+                .iter()
+                .map(|bytes| SessionId::from_slice(bytes).map(|id| id.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut event_stmt = conn.prepare(
+                "SELECT COALESCE(event_kind, 'unknown'), source_event, COUNT(*) \
+                 FROM ingest_keys WHERE taskblu_execution_id = ?1 \
+                 GROUP BY event_kind, source_event ORDER BY event_kind, source_event",
+            )?;
+            let events = event_stmt
+                .query_map([&execution_id], |row| {
+                    Ok(ExecutionEventCount {
+                        event_kind: row.get(0)?,
+                        source_event: row.get(1)?,
+                        count: row.get(2)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let finalized_sessions = conn.query_row(
+                "SELECT COUNT(DISTINCT s.id) FROM sessions s JOIN ingest_keys i ON i.session_id = s.id \
+                 WHERE i.taskblu_execution_id = ?1 AND s.ended_at IS NOT NULL",
+                [&execution_id],
+                |row| row.get::<_, u64>(0),
+            )?;
+            let handoffs_created = conn.query_row(
+                "SELECT COUNT(DISTINCT h.id) FROM handoffs h JOIN ingest_keys i ON i.session_id = h.from_session_id \
+                 WHERE i.taskblu_execution_id = ?1",
+                [&execution_id],
+                |row| row.get::<_, u64>(0),
+            )?;
+            let handoffs_accepted = conn.query_row(
+                "SELECT COUNT(DISTINCT h.id) FROM handoffs h JOIN ingest_keys i ON i.session_id = h.from_session_id \
+                 WHERE i.taskblu_execution_id = ?1 AND h.state = 'accepted'",
+                [&execution_id],
+                |row| row.get::<_, u64>(0),
+            )?;
+            let mut accepting_stmt = conn.prepare(
+                "SELECT DISTINCT h.accepted_by_session FROM handoffs h \
+                 JOIN ingest_keys i ON i.session_id = h.from_session_id \
+                 WHERE i.taskblu_execution_id = ?1 AND h.state = 'accepted' \
+                   AND h.accepted_by_session IS NOT NULL ORDER BY h.accepted_by_session",
+            )?;
+            let accepting_blobs = accepting_stmt
+                .query_map([&execution_id], |row| row.get::<_, Vec<u8>>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let handoff_accepting_session_ids = accepting_blobs
+                .iter()
+                .map(|bytes| SessionId::from_slice(bytes).map(|id| id.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(Some(ExecutionEvidence {
+                taskblu_execution_id: execution_id,
+                paperclip_run_ids,
+                workspaces,
+                projects,
+                session_ids,
+                capture_owners,
+                events,
+                receipts,
+                completed_receipts,
+                pending_receipts: receipts.saturating_sub(completed_receipts),
+                replay_count,
+                finalized_sessions,
+                handoffs_created,
+                handoffs_accepted,
+                handoff_accepting_session_ids,
+                first_seen_at,
+                last_seen_at,
+            }))
+        })
+        .await
+    }
+
     /// Initialise the pool. Connections are opened lazily on first use.
     ///
     /// # Errors
@@ -1266,6 +1488,85 @@ impl ReaderPool {
                     },
                     authority,
                 ));
+            }
+            Ok(rerank_page_hits_with_meta(candidates, limit))
+        })
+        .await
+    }
+
+    /// Run global full-text search against an explicit project allowlist.
+    /// Scope predicates are evaluated before ranking and limiting.
+    pub async fn search_pages_with_meta_for_scopes(
+        &self,
+        query: String,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+        scopes: Vec<(WorkspaceId, ProjectId)>,
+    ) -> StoreResult<Vec<PageHitWithMeta>> {
+        let fts_query = normalize_fts_query(&query);
+        if fts_query.is_empty() || limit == 0 || scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
+            let mut scope_predicate = String::new();
+            let mut values = vec![
+                Value::Text(fts_query),
+                Value::Integer(authority_candidate_limit(limit) as i64),
+                Value::Integer(cutoff),
+            ];
+            for (index, (workspace_id, project_id)) in scopes.into_iter().enumerate() {
+                if index > 0 {
+                    scope_predicate.push_str(" OR ");
+                }
+                let workspace_param = 4 + index * 2;
+                let project_param = workspace_param + 1;
+                let _ = write!(
+                    scope_predicate,
+                    "(pages.workspace_id = ?{workspace_param} AND pages.project_id = ?{project_param})"
+                );
+                values.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+                values.push(Value::Blob(project_id.as_bytes().to_vec()));
+            }
+            let sql = format!(
+                "SELECT workspaces.name, projects.name, pages.path, pages.title, \
+                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24), \
+                        pages_fts.rank, pages.tier, pages.pinned, \
+                        pages.frontmatter_json, {kind_expr} \
+                 FROM pages_fts \
+                 JOIN pages ON pages.rowid = pages_fts.rowid \
+                 JOIN projects ON projects.id = pages.project_id \
+                 JOIN workspaces ON workspaces.id = pages.workspace_id \
+                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired} \
+                   AND ({scope_predicate}) \
+                 ORDER BY pages_fts.rank LIMIT ?2",
+                not_expired = not_expired("pages", "?3"),
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?, row.get::<_, f64>(5)?,
+                    row.get::<_, String>(6)?, row.get::<_, i64>(7)? != 0,
+                    row.get::<_, String>(8)?, row.get::<_, String>(9)?,
+                ))
+            })?;
+            let mut candidates = Vec::new();
+            for row in rows {
+                let (workspace_name, project_name, path, title, snippet, rank, tier, pinned, frontmatter_json, kind) = row?;
+                let authority = PageAuthority::from_stored(
+                    &path, &kind, &tier, pinned, &frontmatter_json,
+                );
+                candidates.push((PageHitWithMeta {
+                    workspace_name,
+                    project_name,
+                    path: PagePath::new(path)?,
+                    title,
+                    snippet,
+                    rank,
+                }, authority));
             }
             Ok(rerank_page_hits_with_meta(candidates, limit))
         })
@@ -1601,6 +1902,67 @@ impl ReaderPool {
                 let snippet: String = row.get(4)?;
                 let rank: f64 = row.get(5)?;
                 Ok((workspace_name, project_name, path, title, snippet, rank))
+            })?;
+            let mut hits = Vec::new();
+            for row in rows {
+                let (workspace_name, project_name, path, title, snippet, rank) = row?;
+                hits.push(PageHitWithMeta {
+                    workspace_name,
+                    project_name,
+                    path: PagePath::new(path)?,
+                    title,
+                    snippet,
+                    rank,
+                });
+            }
+            Ok(hits)
+        })
+        .await
+    }
+
+    /// Return recent pages from an explicit allowlist, applying scope before
+    /// the recency limit.
+    pub async fn recent_pages_global_for_scopes(
+        &self,
+        limit: usize,
+        scopes: Vec<(WorkspaceId, ProjectId)>,
+    ) -> StoreResult<Vec<PageHitWithMeta>> {
+        if limit == 0 || scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(move |conn| {
+            let mut scope_predicate = String::new();
+            let mut values = vec![Value::Integer(limit as i64), Value::Integer(now_us())];
+            for (index, (workspace_id, project_id)) in scopes.into_iter().enumerate() {
+                if index > 0 {
+                    scope_predicate.push_str(" OR ");
+                }
+                let workspace_param = 3 + index * 2;
+                let project_param = workspace_param + 1;
+                let _ = write!(
+                    scope_predicate,
+                    "(pages.workspace_id = ?{workspace_param} AND pages.project_id = ?{project_param})"
+                );
+                values.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+                values.push(Value::Blob(project_id.as_bytes().to_vec()));
+            }
+            let sql = format!(
+                "SELECT workspaces.name, projects.name, pages.path, pages.title, \
+                        substr(pages.body, 1, 240), CAST(pages.updated_at AS REAL) \
+                 FROM pages \
+                 JOIN projects ON projects.id = pages.project_id \
+                 JOIN workspaces ON workspaces.id = pages.workspace_id \
+                 WHERE pages.is_latest = 1{not_expired} AND ({scope_predicate}) \
+                 ORDER BY pages.updated_at DESC LIMIT ?1",
+                not_expired = not_expired("pages", "?2"),
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?, row.get::<_, f64>(5)?,
+                ))
             })?;
             let mut hits = Vec::new();
             for row in rows {
@@ -6028,6 +6390,130 @@ impl ReaderPool {
     pub async fn find_user_by_username(&self, username: String) -> StoreResult<Option<User>> {
         self.with_conn(move |conn| crate::users::find_user_by_username(conn, &username))
             .await
+    }
+
+    /// Return the capability scopes granted to one identity.
+    ///
+    /// An empty set means the identity is unscoped. That is deliberately
+    /// distinct from "granted nothing": the caller decides what unscoped means,
+    /// and the server reads it as the historical unrestricted surface so the
+    /// gate stays opt-in per credential.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error, including an unparseable stored scope.
+    pub async fn identity_scopes(
+        &self,
+        user_id: UserId,
+    ) -> StoreResult<std::collections::BTreeSet<ai_memory_core::CapabilityScope>> {
+        self.with_conn(move |conn| crate::capabilities::find_scopes(conn, user_id))
+            .await
+    }
+
+    /// Resolve an OIDC `(issuer, subject)` pair to its local identity.
+    ///
+    /// `None` means the subject authenticated at the IdP but was never bound
+    /// here. That is a refusal, not an invitation to auto-provision: a server
+    /// that created identities on first sight would let anyone the IdP admits
+    /// become a local actor.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn federated_identity(
+        &self,
+        issuer: String,
+        subject: String,
+    ) -> StoreResult<Option<crate::federation::FederatedIdentity>> {
+        self.with_conn(move |conn| crate::federation::find_identity(conn, &issuer, &subject))
+            .await
+    }
+
+    /// Whether a federated token is revoked, by `jti` or by subject.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error. Callers must treat an error as
+    /// revoked: a denylist that cannot be read is not an empty denylist.
+    pub async fn is_token_revoked(
+        &self,
+        issuer: String,
+        jti: Option<String>,
+        subject: String,
+        now_micros: i64,
+    ) -> StoreResult<bool> {
+        self.with_conn(move |conn| {
+            crate::federation::is_revoked(conn, &issuer, jti.as_deref(), &subject, now_micros)
+        })
+        .await
+    }
+
+    /// Resolve an execution claim against the registry.
+    ///
+    /// Returns the bound authorization context, or the reason it was refused.
+    /// Callers must collapse every rejection reason into one client-facing
+    /// error; see [`crate::executions::ExecutionRejection`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn resolve_execution(
+        &self,
+        taskblu_execution_id: String,
+        user_id: UserId,
+    ) -> StoreResult<Result<crate::executions::Execution, crate::executions::ExecutionRejection>>
+    {
+        let now = jiff::Timestamp::now().as_microsecond();
+        self.with_conn(move |conn| {
+            crate::executions::resolve(conn, &taskblu_execution_id, user_id, now)
+        })
+        .await
+    }
+
+    /// Return the current project membership for one authenticated user.
+    pub async fn project_membership(
+        &self,
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Option<crate::access::ProjectMembership>> {
+        self.with_conn(move |conn| {
+            crate::access::find_membership(conn, user_id, workspace_id, project_id)
+        })
+        .await
+    }
+
+    /// Return the active project scopes visible to one user. This allowlist is
+    /// applied before retrieval so global searches cannot leak denied hits.
+    pub async fn active_project_scopes(
+        &self,
+        user_id: UserId,
+    ) -> StoreResult<Vec<(WorkspaceId, ProjectId)>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT workspace_id, project_id FROM project_memberships \
+                 WHERE user_id = ?1 AND active = 1 \
+                 ORDER BY workspace_id, project_id",
+            )?;
+            let rows = stmt.query_map([user_id.as_bytes()], |row| {
+                let workspace =
+                    WorkspaceId::from_slice(&row.get::<_, Vec<u8>>(0)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })?;
+                let project =
+                    ProjectId::from_slice(&row.get::<_, Vec<u8>>(1)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })?;
+                Ok((workspace, project))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
     }
 
     /// Look up a user by id. **Returns even users whose token is expired**
