@@ -18,6 +18,7 @@ async fn make_state(tmp: &TempDir) -> AdminState {
     let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
     let db_path = store.db_path().to_path_buf();
     AdminState {
+        auth_counters: std::sync::Arc::new(ai_memory_mcp::auth::AuthCounters::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,

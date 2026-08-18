@@ -31,6 +31,8 @@ struct Report {
     /// Passive process-scoped provider health.
     #[serde(default)]
     providers: ProviderHealthSnapshot,
+    #[serde(default)]
+    auth: ai_memory_mcp::auth::AuthCountersSnapshot,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -88,6 +90,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                 },
                 "derived": report.derived,
                 "providers": report.providers,
+                "auth": report.auth,
                 "client": { "server_url": ep.url, "auth": ep.auth_token.is_some() },
             }))?
         );
@@ -119,6 +122,16 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             report.derived.links_from_latest_pages,
             report.derived.unresolved_links_from_latest_pages,
             report.derived.stale_links_from_latest_pages
+        );
+        // O número que interessa é o `static_bearer`: enquanto ele subir, alguma
+        // lane ainda entra pela porta antiga, e "migração concluída" é crença.
+        println!(
+            "  auth:         root={} proxy={} federated={} static-bearer={} denied={}",
+            report.auth.root,
+            report.auth.proxy,
+            report.auth.federated,
+            report.auth.static_bearer,
+            report.auth.denied
         );
         println!("  providers:");
         println!(

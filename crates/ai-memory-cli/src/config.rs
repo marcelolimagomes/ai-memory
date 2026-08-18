@@ -476,6 +476,18 @@ pub struct AuthSettings {
     pub federated_audience: Option<String>,
     /// Absolute JWKS URL of the trusted issuer.
     pub federated_jwks_uri: Option<String>,
+    /// Whether the static per-user bearer (rung 2) still authenticates.
+    ///
+    /// `None` and `Some(true)` behave identically — the rung stays on, so a
+    /// binary upgrade never denies a credential that worked yesterday.
+    /// Setting it to `false` is the deliberate end of compatibility: a lane
+    /// still carrying a static token is refused, while the root bearer
+    /// (break-glass) and the federated rung keep working.
+    ///
+    /// Turning it off is what makes "the lanes migrated" demonstrable rather
+    /// than asserted; `status` reports the per-rung counters that say whether
+    /// it is safe to do so.
+    pub legacy_static_bearer_enabled: Option<bool>,
 }
 
 impl AuthSettings {

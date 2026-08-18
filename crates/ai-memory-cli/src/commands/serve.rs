@@ -618,8 +618,14 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 sanitizer: sanitizer.clone(),
                 data_dir: config.data_dir.clone(),
             });
+            // Criados aqui porque o AdminState nasce antes do AuthState e os
+            // dois precisam do MESMO contador: um relatório que conta de um
+            // lado e é lido do outro não mede nada.
+            let auth_counters =
+                std::sync::Arc::new(ai_memory_mcp::auth::AuthCounters::default());
             let admin = admin_router_with_decay_breadth(
                 AdminState {
+                    auth_counters: std::sync::Arc::clone(&auth_counters),
                     writer: store.writer.clone(),
                     reader: store.reader.clone(),
                     wiki: wiki.clone(),
@@ -657,7 +663,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             //     the users-table lookup, including before the first user is
             //     created. Admin mode separately switches on a fresh
             //     store-backed users-exist read.
-            let mut auth_state = AuthState::new(config.auth.bearer_token.clone());
+            let mut auth_state = AuthState::new(config.auth.bearer_token.clone())
+                .with_counters(std::sync::Arc::clone(&auth_counters))
+                .with_legacy_static_bearer(
+                    config.auth.legacy_static_bearer_enabled.unwrap_or(true),
+                );
             let root_user = config
                 .auth
                 .root_username

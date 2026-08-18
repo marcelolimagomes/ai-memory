@@ -43,6 +43,7 @@
 //! `Authorization` header in its config.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ai_memory_core::{ActorContext, AuthLevel, IdentityKey};
 use ai_memory_store::{ReaderPool, TokenPepper, WriterHandle, hash_token};
@@ -83,7 +84,7 @@ pub struct MultiUserResolver {
 /// Shared auth state. Cheap to clone — just an `Arc` wrapping the
 /// optional configured token + the optional multi-user resolver +
 /// the root actor template.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AuthState {
     /// Bearer token that authenticates as **root**. `None` means
     /// "auth disabled at the wire level" — rung 0.
@@ -105,6 +106,70 @@ pub struct AuthState {
     /// which is the default and the state every existing deployment stays in
     /// until an operator configures an issuer.
     federated: Option<FederatedResolver>,
+    /// Compatibility switch for the static multi-user bearer (rung 2).
+    ///
+    /// Default `true`: nothing changes for a deployment that never sets it.
+    /// Turning it off is the measurable end of compatibility the identity
+    /// contract asks for -- a lane that still carries a static token stops
+    /// authenticating, while root (break-glass) and the federated rung keep
+    /// working. Without a switch, "the lanes migrated" can only be asserted,
+    /// never demonstrated.
+    legacy_static_bearer_enabled: bool,
+    /// Per-rung authentication counters.
+    ///
+    /// The criterion "zero authentications by the legacy bearer during the
+    /// observation window" needs an instrument, and a client-side counter
+    /// cannot be one: it sees what goes through it and by construction not
+    /// what bypasses it. This counts at the only place every request passes.
+    counters: Arc<AuthCounters>,
+}
+
+/// Authentications per rung, since process start.
+///
+/// Deliberately counts, not logs: a counter answers "did anything still come
+/// in through the old door" without keeping a record of who knocked.
+#[derive(Debug, Default)]
+pub struct AuthCounters {
+    /// Rung 1 — root bearer. Break-glass; expected to be low and non-zero.
+    pub root: AtomicU64,
+    /// Rung 1b — trusted proxy assertion.
+    pub proxy: AtomicU64,
+    /// Rung 1c — federated JWT.
+    pub federated: AtomicU64,
+    /// Rung 2 — static per-user bearer. THE number the compatibility
+    /// criterion is about: it has to reach zero and stay there.
+    pub static_bearer: AtomicU64,
+    /// Requests that matched no rung.
+    pub denied: AtomicU64,
+}
+
+/// Serialisable view of [`AuthCounters`].
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, Default)]
+pub struct AuthCountersSnapshot {
+    /// Rung 1 — root bearer (break-glass).
+    pub root: u64,
+    /// Rung 1b — trusted proxy assertion.
+    pub proxy: u64,
+    /// Rung 1c — federated JWT.
+    pub federated: u64,
+    /// Rung 2 — static per-user bearer; the compatibility number.
+    pub static_bearer: u64,
+    /// Requests that matched no rung.
+    pub denied: u64,
+}
+
+impl AuthCounters {
+    /// Point-in-time copy of every rung counter.
+    #[must_use]
+    pub fn snapshot(&self) -> AuthCountersSnapshot {
+        AuthCountersSnapshot {
+            root: self.root.load(Ordering::Relaxed),
+            proxy: self.proxy.load(Ordering::Relaxed),
+            federated: self.federated.load(Ordering::Relaxed),
+            static_bearer: self.static_bearer.load(Ordering::Relaxed),
+            denied: self.denied.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Optional federated tier — validate a JWT against a trusted issuer's JWKS
@@ -121,6 +186,24 @@ pub struct FederatedResolver {
     pub reader: ReaderPool,
     /// Writer for the fire-and-forget `last_seen_at` bump.
     pub writer: WriterHandle,
+}
+
+impl Default for AuthState {
+    /// `legacy_static_bearer_enabled` nasce `true` de propósito: derivar
+    /// `Default` daria `false` e uma atualização de binário passaria a negar
+    /// credencial que funcionava — o oposto de "nenhuma capacidade nasce
+    /// ligada", que fala de ligar imposição, não de desligar o que já servia.
+    fn default() -> Self {
+        Self {
+            expected: None,
+            root_actor: ActorContext::default(),
+            multiuser: None,
+            actor_proxy_bearer: None,
+            federated: None,
+            legacy_static_bearer_enabled: true,
+            counters: Arc::new(AuthCounters::default()),
+        }
+    }
 }
 
 impl AuthState {
@@ -218,6 +301,32 @@ impl AuthState {
             writer,
         });
         self
+    }
+
+    /// Turn the static per-user bearer rung on or off.
+    ///
+    /// Off is what makes "the lanes no longer use the old credential" a
+    /// measurable claim instead of a belief: with it off, a lane still
+    /// carrying a static token is denied, while root and the federated rung
+    /// are untouched.
+    #[must_use]
+    pub fn with_legacy_static_bearer(mut self, enabled: bool) -> Self {
+        self.legacy_static_bearer_enabled = enabled;
+        self
+    }
+
+    /// Share an externally-created counter set, so the status endpoint and the
+    /// middleware report the same numbers.
+    #[must_use]
+    pub fn with_counters(mut self, counters: Arc<AuthCounters>) -> Self {
+        self.counters = counters;
+        self
+    }
+
+    /// Handle to the per-rung counters, for the status endpoint.
+    #[must_use]
+    pub fn counters(&self) -> Arc<AuthCounters> {
+        Arc::clone(&self.counters)
     }
 
     /// True when a token is configured (i.e. the middleware is doing
@@ -359,6 +468,7 @@ pub async fn require_bearer(
     // Rung 1: root credential. Actor assertion headers are intentionally
     // ignored here; only the distinct proxy credential may assert them.
     if bool::from(provided.as_bytes().ct_eq(expected.as_bytes())) {
+        state.counters.root.fetch_add(1, Ordering::Relaxed);
         req.extensions_mut().insert(state.root_actor.clone());
         req.extensions_mut().insert(AuthLevel::Root);
 
@@ -398,6 +508,7 @@ pub async fn require_bearer(
             AuthLevel::User
         };
         debug!(actor.user = ?actor.user, actor.issuer = ?actor.issuer, actor.sub = ?actor.sub, ?level, "identity asserted by trusted proxy");
+        state.counters.proxy.fetch_add(1, Ordering::Relaxed);
         req.extensions_mut().insert(actor);
         req.extensions_mut().insert(level);
         return next.run(req).await;
@@ -416,12 +527,18 @@ pub async fn require_bearer(
         && crate::federated::looks_like_jwt(bearer)
     {
         return match federated_rung(fed, bearer, req, next).await {
-            Ok(response) => response,
+            Ok(response) => {
+                state.counters.federated.fetch_add(1, Ordering::Relaxed);
+                response
+            }
             Err(()) => {
                 // Every federated failure lands here as one 401. The specific
                 // reason was logged; surfacing it to the caller would turn the
                 // rung into an oracle for issuer, audience and key state.
-                unauthorized(is_get)
+                {
+                    state.counters.denied.fetch_add(1, Ordering::Relaxed);
+                    unauthorized(is_get)
+                }
             }
         };
     }
@@ -429,6 +546,7 @@ pub async fn require_bearer(
     // Rung 2: bearer matches neither root nor proxy. If multi-user is enabled,
     // hash + look up the token against the `users` table.
     if let Some(mu) = state.multiuser.as_ref()
+        && state.legacy_static_bearer_enabled
         && !provided.is_empty()
     {
         let hash = hash_token(provided, &mu.pepper);
@@ -437,6 +555,7 @@ pub async fn require_bearer(
                 // NEVER log the token itself; the username + agent is
                 // safe and useful for "who hit /api/v1 last".
                 debug!(actor.user = %user.username, "authenticated as DB user");
+                state.counters.static_bearer.fetch_add(1, Ordering::Relaxed);
                 let actor = ActorContext {
                     user: Some(user.username.clone()),
                     name: user.name.clone(),
@@ -476,12 +595,14 @@ pub async fn require_bearer(
             }
             Err(e) => {
                 tracing::error!(error = %e, "auth: users table lookup failed");
+                state.counters.denied.fetch_add(1, Ordering::Relaxed);
                 return unauthorized(is_get);
             }
         }
     }
 
     debug!("auth rejected: invalid or missing token");
+    state.counters.denied.fetch_add(1, Ordering::Relaxed);
     unauthorized(is_get)
 }
 
@@ -1702,6 +1823,53 @@ mod tests {
             probe_with_bearer(plain_state, FAKE_JWT).await,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[tokio::test]
+    async fn turning_off_compatibility_denies_the_static_bearer_and_keeps_root() {
+        // O critério de encerramento pede uma mutação: desligar a flag tem de
+        // NEGAR a lane. Sem esta asserção, "as lanes migraram" é crença --
+        // ninguém consegue mostrar que a porta antiga fechou.
+        let (_tmp, state, user_token) = setup_multiuser("lane-compat").await;
+
+        // Ligada (o padrão): a credencial estática entra.
+        assert_eq!(
+            probe_with_bearer(state.clone(), &user_token).await,
+            StatusCode::OK
+        );
+
+        let closed = state.clone().with_legacy_static_bearer(false);
+        // Desligada: a MESMA credencial é negada...
+        assert_eq!(
+            probe_with_bearer(closed.clone(), &user_token).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // ...e o root continua entrando. Fechar a compatibilidade não pode
+        // fechar o break-glass junto: seria trocar um risco por um bloqueio.
+        assert_eq!(
+            probe_with_bearer(closed, "root-token-distinct-from-user-token").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn the_counters_separate_the_old_door_from_the_new_one() {
+        // O critério "zero autenticações pelo bearer legado" precisa de um
+        // instrumento no servidor: um contador no cliente vê o que passa por
+        // ele e, por construção, não vê o que o contorna.
+        let (_tmp, state, user_token) = setup_multiuser("lane-counters").await;
+        let counters = state.counters();
+        assert_eq!(counters.snapshot().static_bearer, 0);
+
+        probe_with_bearer(state.clone(), &user_token).await;
+        probe_with_bearer(state.clone(), "root-token-distinct-from-user-token").await;
+        probe_with_bearer(state.clone(), "nao-e-credencial-nenhuma").await;
+
+        let seen = counters.snapshot();
+        assert_eq!(seen.static_bearer, 1, "a porta antiga não foi contada");
+        assert_eq!(seen.root, 1, "o break-glass não foi contado");
+        assert_eq!(seen.denied, 1, "a negação não foi contada");
+        assert_eq!(seen.federated, 0);
     }
 
     #[tokio::test]

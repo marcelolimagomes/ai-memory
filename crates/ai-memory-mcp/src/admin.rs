@@ -86,6 +86,8 @@ struct DecayBreadthWeight(f64);
 /// Shared state for the admin router.
 #[derive(Clone)]
 pub struct AdminState {
+    /// Per-rung authentication counters, shared with the auth middleware.
+    pub auth_counters: std::sync::Arc<crate::auth::AuthCounters>,
     /// Writer actor handle — used to get-or-create workspace/project.
     pub writer: WriterHandle,
     /// Reader pool — used by the idempotency check inside Bootstrap.
@@ -835,6 +837,10 @@ pub struct StatusReport {
     pub counts: ai_memory_store::StatusCounts,
     /// Derived-index and retrieval-readiness diagnostics.
     pub derived: ai_memory_store::DerivedIndexStatus,
+    /// Authentications per rung since process start. `static_bearer` is the
+    /// one the compatibility criterion is about: it has to reach zero and
+    /// stay there before the old door can be closed.
+    pub auth: crate::auth::AuthCountersSnapshot,
     /// Passive process-scoped provider health.
     pub providers: ProviderHealthSnapshot,
 }
@@ -868,6 +874,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                     db_path: state.db_path.display().to_string(),
                     counts,
                     derived,
+                    auth: state.auth_counters.snapshot(),
                     providers: state.provider_health.snapshot(),
                 };
                 (
@@ -5757,6 +5764,7 @@ mod tests {
             .unwrap()
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -5817,6 +5825,7 @@ mod tests {
             .unwrap();
 
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -5939,6 +5948,7 @@ mod tests {
         }
 
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -6172,6 +6182,7 @@ mod tests {
         }
 
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -6365,6 +6376,7 @@ mod tests {
         store.writer.end_session(ended, None).await.unwrap();
 
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -6544,6 +6556,7 @@ mod tests {
             .unwrap()
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -6577,6 +6590,7 @@ mod tests {
         llm: Option<Arc<dyn LlmProvider>>,
     ) -> AdminState {
         AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -8020,6 +8034,7 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -8129,6 +8144,7 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -8231,6 +8247,7 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -8339,6 +8356,7 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -8886,6 +8904,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let pepper = ai_memory_store::TokenPepper::new("test-pepper-admin");
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -9240,6 +9259,7 @@ mod tests {
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -9371,6 +9391,7 @@ mod tests {
         let missing_db_reader =
             ai_memory_store::ReaderPool::new(&tmp.path().join("missing.sqlite"), 1).unwrap();
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: missing_db_reader,
             wiki,
@@ -9677,6 +9698,7 @@ mod tests {
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let router = admin_router(AdminState {
+            auth_counters: std::sync::Arc::new(crate::auth::AuthCounters::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
