@@ -240,7 +240,17 @@ impl FederatedAuth {
         };
 
         let mut validation = Validation::new(header.alg);
-        validation.algorithms = APPROVED_ALGORITHMS.to_vec();
+        // Exactly the header's algorithm, and nothing else. jsonwebtoken 11
+        // refuses a validation list that mixes key families -- an RSA key with
+        // `[RS256, ES256]` in the list fails as InvalidAlgorithm before the
+        // signature is ever checked, so listing the whole allowlist here
+        // refused EVERY token the rung was built to accept.
+        //
+        // Narrowing to one algorithm loses nothing: `header.alg` was already
+        // checked against APPROVED_ALGORITHMS above, so an attacker cannot get
+        // here with HS256, and `Jwk::permits` independently blocks key
+        // confusion between families.
+        validation.algorithms = vec![header.alg];
         validation.set_issuer(&[self.config.issuer.as_str()]);
         validation.set_audience(&[self.config.audience.as_str()]);
         validation.leeway = LEEWAY_SECONDS;
@@ -357,6 +367,26 @@ mod tests {
         assert!(!looks_like_jwt("aaa..ccc"));
         assert!(!looks_like_jwt("not-a-jwt"));
         assert!(!looks_like_jwt(""));
+    }
+
+    #[test]
+    fn the_validation_list_names_only_the_header_algorithm() {
+        // Regression: jsonwebtoken 11 rejects a mixed-family algorithm list
+        // with InvalidAlgorithm, before verifying the signature. With
+        // `[RS256, ES256]` here the federated rung refused every valid token
+        // and every test still passed -- because every test asserted a
+        // refusal. A gate whose tests only prove denial can be totally broken
+        // and look perfect.
+        for alg in APPROVED_ALGORITHMS {
+            let mut validation = Validation::new(alg);
+            validation.algorithms = vec![alg];
+            assert_eq!(
+                validation.algorithms,
+                vec![alg],
+                "a validation list with more than one family fails as InvalidAlgorithm"
+            );
+            assert_eq!(validation.algorithms.len(), 1);
+        }
     }
 
     #[test]
